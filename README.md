@@ -9,13 +9,11 @@
 ## 1) Criar projeto no Supabase (grátis)
 1. Acesse https://supabase.com/ e crie uma conta.
 2. Crie um projeto → escolha **Region** e **Senha do banco**.
-3. No Dashboard: **Project Settings → Database** → copie a URL do banco (ex.: `postgresql://...`) e guarde.
-4. Em **Project Settings → API**: copie **Project URL** e **anon key**.
+3. No Dashboard: **Project Settings → API**: copie **Project URL** e **anon key**.
+4. Na **Home do projeto**: clique em **Connection string** e copie a **URI** (postgresql://...).
+5. Em **Storage → Create new bucket** → nome: `rnc-fotos` → marque **Public**.
 
-## 2) Criar bucket de Storage (fotos)
-- Em **Storage → Create new bucket** → nome: `rnc-fotos` → marque **Public**.
-
-## 3) Publicar no Streamlit Cloud
+## 2) Publicar no Streamlit Cloud
 Suba os arquivos deste pacote para um repositório no GitHub e faça deploy apontando para `app.py`.
 
 ### Secrets (App settings → Secrets)
@@ -26,7 +24,7 @@ QUALITY_PASS="sua_senha_forte"
 # Supabase
 SUPABASE_URL="https://SEU-PROJECT-REF.supabase.co"
 SUPABASE_KEY="sua_anon_key_ou_service_key"
-SUPABASE_DB_URL="postgresql://usuario:senha@host:5432/postgres"  # de Project Settings → Database
+SUPABASE_DB_URL="postgresql://usuario:senha@host:5432/postgres"  # de Connection string (URI)
 SUPABASE_BUCKET="rnc-fotos"
 
 # (opcional) E-mail SMTP
@@ -38,9 +36,7 @@ EMAIL_FROM="seu.email@empresa.com"
 EMAIL_TO="qualidade@empresa.com, gestor@empresa.com"
 ```
 
-> Dica: se quiser permissões mais fortes para Storage, use a **service_role key** em SUPABASE_KEY e mantenha segura no Secrets.
-
-## 4) Pronto!
+## 3) Pronto!
 - Aberturas, encerramentos e reaberturas gravam no Postgres
 - Fotos são enviadas ao bucket e o app guarda apenas o **link**
 - PDF baixa as imagens direto do Storage

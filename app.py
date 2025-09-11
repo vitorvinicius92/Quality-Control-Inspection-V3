@@ -47,6 +47,7 @@ EMAIL_TO = [e.strip() for e in os.getenv("EMAIL_TO", "").split(",") if e.strip()
 
 # ====== Conexões ======
 def get_db_engine():
+    # Prioriza Supabase Postgres; se não tiver, cai para SQLite (local)
     db_url = SUPABASE_DB_URL or "sqlite:///rnc.db"
     return create_engine(db_url, poolclass=NullPool, future=True)
 
@@ -65,6 +66,7 @@ supabase = get_supabase()
 # ====== DB & Migrações (Postgres/SQLite) ======
 def init_db():
     with engine.begin() as conn:
+        # Tabela principal
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS inspecoes (
             id BIGSERIAL PRIMARY KEY,
@@ -134,6 +136,7 @@ def init_db():
             cancelamento_motivo TEXT
         );
         """)
+        # Fotos: guardamos apenas URLs do Storage
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS fotos (
             id BIGSERIAL PRIMARY KEY,
@@ -156,11 +159,13 @@ def init_db():
             tipo TEXT CHECK (tipo IN ('abertura','encerramento','reabertura'))
         );
         """)
+        # PEPs
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS peps (id BIGSERIAL PRIMARY KEY, code TEXT UNIQUE);
         """.replace("BIGSERIAL","INTEGER") if engine.url.get_backend_name()=="sqlite" else """
         CREATE TABLE IF NOT EXISTS peps (id BIGSERIAL PRIMARY KEY, code TEXT UNIQUE);
         """)
+        # Settings (logo)
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, blob BYTEA, text TEXT);
         """.replace("BYTEA","BLOB") if engine.url.get_backend_name()=="sqlite" else """
@@ -211,11 +216,13 @@ def add_peps_bulk(codes:list):
 
 # ====== Supabase Storage (fotos) ======
 def storage_upload_images(files, tipo: str, rnc_num: str):
+    """Sobe imagens p/ Supabase Storage e retorna lista de dicts {url, path, filename, mimetype}"""
     out = []
     if not files: return out
     if not supabase:
         st.warning("Supabase não configurado: fotos não serão salvas na nuvem.")
         return out
+    # garante bucket
     try:
         supabase.storage.create_bucket(SUPABASE_BUCKET, public=True)
     except Exception:
@@ -338,6 +345,7 @@ def cancel_inspecao(iid:int, por:str, motivo:str):
         """), {"dt": datetime.now(), "por": por, "motivo": motivo, "iid": iid})
 
 def delete_inspecao(iid:int):
+    # remove registros do DB; as fotos permanecem no Storage (boa prática para auditoria)
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM fotos WHERE inspecao_id=:iid"), {"iid": iid})
         conn.execute(text("DELETE FROM inspecoes WHERE id=:iid"), {"iid": iid})
@@ -432,6 +440,7 @@ def generate_pdf(iid:int) -> str:
         if cur: lines.append(cur)
         return lines or ["-"]
 
+    # Abertura
     y = draw_block("Descrição da não conformidade:", row.get("descricao"), y - 10*mm)
     y = draw_block("Referências:", row.get("referencias"), y - 6*mm)
     y = draw_block("Causador:", row.get("causador"), y - 6*mm)
@@ -439,19 +448,23 @@ def generate_pdf(iid:int) -> str:
     y = draw_block("Origem:", row.get("origem"), y - 6*mm)
     y = draw_block("Ação de correção:", row.get("acao_correcao"), y - 6*mm)
 
+    # Encerramento
     y = draw_block("Encerramento — observações:", row.get("encerramento_obs"), y - 8*mm)
     y = draw_block("Encerramento — descrição detalhada:", row.get("encerramento_desc"), y - 6*mm)
     y = draw_block("Eficácia:", row.get("eficacia"), y - 6*mm)
     y = draw_block("Encerrado por / Em:", f"{row.get('encerrada_por') or '-'} / {row.get('encerrada_em') or '-'}", y - 6*mm)
 
+    # Reabertura
     y = draw_block("Reabertura — motivo:", row.get("reabertura_motivo"), y - 8*mm)
     y = draw_block("Reabertura — descrição detalhada:", row.get("reabertura_desc"), y - 6*mm)
     y = draw_block("Reaberta por / Em:", f"{row.get('reaberta_por') or '-'} / {row.get('reaberta_em') or '-'}", y - 6*mm)
 
+    # Cancelamento
     if str(row.get("status")).lower() == "cancelada":
         y = draw_block("Cancelamento — motivo:", row.get("cancelamento_motivo"), y - 8*mm)
         y = draw_block("Cancelada por / Em:", f"{row.get('cancelada_por') or '-'} / {row.get('cancelada_em') or '-'}", y - 6*mm)
 
+    # Fotos (baixadas por URL)
     def draw_images(urls, titulo):
         nonlocal y
         if not urls: return
@@ -505,6 +518,7 @@ with st.sidebar.expander("🔐 Entrar (Qualidade) — cadastrar/editar"):
         st.session_state.is_quality = False
         st.info("Agora você está como Visitante.")
 
+# Logo
 with st.sidebar.expander("🖼️ Logo da empresa (para PDF e topo)"):
     logo_bytes = settings_get_logo()
     if logo_bytes:
@@ -518,6 +532,7 @@ with st.sidebar.expander("🖼️ Logo da empresa (para PDF e topo)"):
             settings_set_logo(up_logo.getbuffer().tobytes())
             st.success("Logo atualizada! Recarregue a página para ver.")
 
+# Menu
 if st.session_state.is_quality:
     menu = st.sidebar.radio("Navegação", ["Nova RNC", "Consultar/Encerrar/Reabrir", "Importar/Exportar", "Gerenciar PEPs"], label_visibility="collapsed")
 else:
@@ -530,6 +545,7 @@ PROCESSO_OPTS = ["Comercial","Compras","Planejamento","Recebimento","Produção"
 ORIGEM_OPTS = ["Pintura","Orçamento","Usinagem","Almoxarifado","Solda","Montagem","Cliente","Expedição","Preparação","R.H","Outros"]
 ACAO_CORRECAO_OPTS = ["Refugo","Retrabalho","Aceitar sob concessão","Comunicar ao fornecedor","Ver e agir","Limpeza","Manutenção","Solicitação de compra"]
 
+# ====== Nova RNC ======
 if menu == "Nova RNC":
     st.header("Nova RNC (RNC Nº automático)")
     blob = settings_get_logo()
@@ -586,6 +602,7 @@ if menu == "Nova RNC":
             iid = insert_inspecao(rec, meta)
             st.success(f"RNC salva! Nº {rnc_num} • Código interno: #{iid}")
 
+# ====== Consultar / Encerrar / Reabrir ======
 elif menu == "Consultar/Encerrar/Reabrir":
     st.header("Consulta de RNCs")
     df = fetch_df()
@@ -645,9 +662,9 @@ elif menu == "Consultar/Encerrar/Reabrir":
                 tabs = st.tabs(["📸 Abertura", "✅ Encerramento", "♻️ Reabertura", "🗂️ Cancelamento / Exclusão"])
                 with tabs[0]:
                     for rec in fetch_photos(int(row["id"]), "abertura"):
-                        try: st.image(rec["url"], width=360)
+                        try: st.image(rec["url"], width=360)  # via URL
                         except: st.caption("Foto indisponível")
-                with tabs[1]):
+                with tabs[1]:
                     enc = fetch_photos(int(row["id"]), "encerramento")
                     st.markdown("**Observações de encerramento:**")
                     st.write(row.get("encerramento_obs") or "-")
@@ -716,6 +733,7 @@ elif menu == "Consultar/Encerrar/Reabrir":
                             elif do_delete:
                                 st.warning("Digite CONFIRMAR exatamente para prosseguir.")
 
+# ====== Importar / Exportar ======
 elif menu == "Importar/Exportar":
     st.header("Importar / Exportar (CSV)")
 
@@ -737,6 +755,7 @@ elif menu == "Importar/Exportar":
             except Exception:
                 up.seek(0)
                 df_imp = pd.read_csv(up, sep=";")
+            # normalização simples
             aliases = {"rnc nº":"rnc_num","rnc_no":"rnc_num","rnc":"rnc_num","responsável":"responsavel","pep_descricao":"pep"}
             df_imp.columns = [aliases.get(str(c).strip().lower().replace(" ","_"), str(c).strip().lower().replace(" ","_")) for c in df_imp.columns]
             for c in EXPECTED_COLS():
@@ -772,6 +791,7 @@ elif menu == "Importar/Exportar":
         csv_bytes = df.to_csv(index=False, sep=";").encode("utf-8-sig")
         st.download_button("Baixar CSV", data=csv_bytes, file_name="rnc_export_v08_supabase.csv", mime="text/csv")
 
+# ====== Gerenciar PEPs ======
 elif menu == "Gerenciar PEPs":
     st.header("Gerenciar PEPs (Qualidade)")
     st.caption("Importe ou adicione itens como 'C023553 — ADEQ. ...' para aparecer na lista.")
@@ -798,6 +818,7 @@ elif menu == "Gerenciar PEPs":
                 st.success(f"{n} PEP(s) importado(s).")
             else:
                 st.error("CSV deve conter uma coluna chamada 'code'.")
+    # Lista
     with engine.begin() as conn:
-        df_pep = pd.read_sql(text("SELECT code AS 'PEP — descrição' FROM peps ORDER BY code"), conn)
+        df_pep = pd.read_sql(text("SELECT code AS "PEP — descrição" FROM peps ORDER BY code"), conn)
     st.dataframe(df_pep, use_container_width=True, hide_index=True)
