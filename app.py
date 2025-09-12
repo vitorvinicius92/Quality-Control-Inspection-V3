@@ -20,7 +20,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-st.set_page_config(page_title="RNC v08 — Completo (v4 antifalha)", page_icon="📝", layout="wide")
+st.set_page_config(page_title="RNC v08 — Completo (v5 com contador por ano)", page_icon="📝", layout="wide")
 
 # ----------------- Secrets / Env -----------------
 SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
@@ -122,6 +122,13 @@ def init_db():
                 text TEXT
             );
             """)
+            # contador por ano
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS rnc_counters (
+                year INTEGER PRIMARY KEY,
+                last_seq INTEGER NOT NULL
+            );
+            """)
             conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uidx_inspecoes_rnc ON inspecoes (rnc_num);")
         else:
             conn.exec_driver_sql("""
@@ -182,6 +189,12 @@ def init_db():
                 text TEXT
             );
             """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS rnc_counters (
+                year INTEGER PRIMARY KEY,
+                last_seq INTEGER NOT NULL
+            );
+            """)
             conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uidx_inspecoes_rnc ON inspecoes (rnc_num);")
 
 init_db()
@@ -212,22 +225,116 @@ def auth_box():
         if st.button("Remover logo"):
             clear_logo(); st.warning("Logo removida.")
 
-def next_rnc_num_sql(conn) -> str:
-    y = datetime.now().year
+def set_logo(image_bytes: bytes):
+    with engine.begin() as conn:
+        if DB_KIND == "postgresql":
+            conn.exec_driver_sql("INSERT INTO settings(key, blob) VALUES('logo', :b) ON CONFLICT (key) DO UPDATE SET blob=EXCLUDED.blob", {"b": image_bytes})
+        else:
+            conn.exec_driver_sql("INSERT OR REPLACE INTO settings(key, blob) VALUES('logo', :b)", {"b": image_bytes})
+
+def get_logo() -> Optional[bytes]:
+    with engine.begin() as conn:
+        r = conn.exec_driver_sql("SELECT blob FROM settings WHERE key='logo'").fetchone()
+    return bytes(r[0]) if (r and r[0] is not None) else None
+
+def clear_logo():
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM settings WHERE key='logo'")
+
+def get_supabase_bucket():
+    if not supabase:
+        return None
+    try:
+        supabase.storage.create_bucket(SUPABASE_BUCKET, public=True)
+    except Exception:
+        pass
+    return supabase.storage.from_(SUPABASE_BUCKET)
+
+def upload_photos(files, rnc_num: str, tipo: str) -> List[dict]:
+    out = []
+    if not files:
+        return out
+    bucket = get_supabase_bucket()
+    if not bucket:
+        st.warning("Supabase Storage não configurado — as fotos não serão enviadas para a nuvem.")
+        return out
+    for f in files:
+        try:
+            ext = os.path.splitext(f.name)[1].lower() or ".jpg"
+            key = f"{rnc_num}/{tipo}/{uuid.uuid4().hex}{ext}"
+            data = f.read(); f.seek(0)
+            bucket.upload(key, data, {"content-type": f.type or "image/jpeg"})
+            url = bucket.get_public_url(key)
+            out.append({"url": url, "path": key, "filename": f.name, "mimetype": f.type or "image/jpeg", "tipo": tipo})
+        except Exception as e:
+            st.error(f"Falha ao subir {f.name}: {e}")
+    return out
+
+# ---------- Contador por ano (elimina erro no SPLIT_PART/substr) ----------
+def next_rnc_num_tx(conn) -> str:
+    y = int(datetime.now().year)
     if DB_KIND == "postgresql":
-        q = text("""
-            SELECT COALESCE(MAX(CAST(SPLIT_PART(rnc_num, '-', 2) AS INTEGER)), 0)
-            FROM inspecoes
-            WHERE rnc_num LIKE :p
-        """)
+        seq = conn.exec_driver_sql("""
+            INSERT INTO rnc_counters AS rc(year, last_seq)
+            VALUES (:y, 0)
+            ON CONFLICT (year) DO UPDATE SET last_seq = rc.last_seq + 1
+            RETURNING last_seq;
+        """, {"y": y}).scalar_one()
     else:
-        q = text("""
-            SELECT COALESCE(MAX(CAST(substr(rnc_num, instr(rnc_num, '-')+1) AS INTEGER)), 0)
-            FROM inspecoes
-            WHERE rnc_num LIKE :p
-        """)
-    mx = conn.execute(q, {"p": f"{y}-%"}).scalar() or 0
-    return f"{y}-{int(mx)+1:03d}"
+        # SQLite 3.35+ suporta RETURNING; se falhar, faz SELECT+UPDATE
+        try:
+            seq = conn.exec_driver_sql("""
+                INSERT INTO rnc_counters(year, last_seq) VALUES (:y, 0)
+                ON CONFLICT(year) DO UPDATE SET last_seq = last_seq + 1
+                RETURNING last_seq;
+            """, {"y": y}).scalar_one()
+        except Exception:
+            row = conn.exec_driver_sql("SELECT last_seq FROM rnc_counters WHERE year=:y", {"y": y}).fetchone()
+            if row is None:
+                conn.exec_driver_sql("INSERT INTO rnc_counters(year, last_seq) VALUES (:y, 0)", {"y": y})
+                seq = 0
+            else:
+                seq = int(row[0]) + 1
+                conn.exec_driver_sql("UPDATE rnc_counters SET last_seq=:s WHERE year=:y", {"s": seq, "y": y})
+    return f"{y}-{int(seq):03d}"
+
+# Inserção antifalha usando contador
+def insert_rnc_with_counter(conn, payload: dict) -> (int, str):
+    tentativas = 30
+    for _ in range(tentativas):
+        num = next_rnc_num_tx(conn)
+        payload2 = dict(payload); payload2["rnc"] = num
+        try:
+            if DB_KIND == "postgresql":
+                rid = conn.exec_driver_sql("""
+                    INSERT INTO inspecoes
+                    (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
+                     processo_envolvido, origem, severidade, categoria, acoes, status)
+                    VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
+                    ON CONFLICT (rnc_num) DO NOTHING
+                    RETURNING id;
+                """, payload2).scalar()
+                if rid is not None:
+                    return int(rid), num
+            else:
+                conn.exec_driver_sql("""
+                    INSERT OR IGNORE INTO inspecoes
+                    (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
+                     processo_envolvido, origem, severidade, categoria, acoes, status)
+                    VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta');
+                """, payload2)
+                rid = conn.exec_driver_sql("SELECT last_insert_rowid()").scalar()
+                if rid and int(rid) > 0:
+                    return int(rid), num
+        except Exception:
+            pass
+        time.sleep(0.03)
+    raise RuntimeError("Não foi possível alocar número de RNC.")
+
+# ----------------- UI -----------------
+def list_peps() -> List[str]:
+    with engine.begin() as c:
+        return [r[0] for r in c.exec_driver_sql("SELECT code FROM peps ORDER BY code").fetchall()]
 
 def add_peps_bulk(codes: List[str]) -> int:
     ok = 0
@@ -245,108 +352,117 @@ def add_peps_bulk(codes: List[str]) -> int:
                 pass
     return ok
 
-def set_logo(image_bytes: bytes):
-    with engine.begin() as conn:
-        if DB_KIND == "postgresql":
-            conn.exec_driver_sql("INSERT INTO settings(key, blob) VALUES('logo', :b) ON CONFLICT (key) DO UPDATE SET blob=EXCLUDED.blob", {"b": image_bytes})
-        else:
-            conn.exec_driver_sql("INSERT OR REPLACE INTO settings(key, blob) VALUES('logo', :b)", {"b": image_bytes})
+def generate_pdf(irow: dict, fotos_ab: List[dict], fotos_enc: List[dict], fotos_rea: List[dict]) -> bytes:
+    import io as _io, requests
+    buf = _io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    W, H = A4
 
-def get_logo() -> Optional[bytes]:
-    with engine.begin() as conn:
-        r = conn.exec_driver_sql("SELECT blob FROM settings WHERE key='logo'").fetchone()
-    return bytes(r[0]) if (r and r[0] is not None) else None
-
-def clear_logo():
-    with engine.begin() as conn:
-        conn.exec_driver_sql("DELETE FROM settings WHERE key='logo'")
-
-def upload_photos(files, rnc_num: str, tipo: str) -> List[dict]:
-    out = []
-    if not files:
-        return out
-    if not supabase:
-        st.warning("Supabase Storage não configurado — as fotos não serão enviadas para a nuvem.")
-        return out
-    try:
-        supabase.storage.create_bucket(SUPABASE_BUCKET, public=True)
-    except Exception:
-        pass
-    for f in files:
+    y = H - 30
+    logo = get_logo()
+    if logo:
         try:
-            ext = os.path.splitext(f.name)[1].lower() or ".jpg"
-            key = f"{rnc_num}/{tipo}/{uuid.uuid4().hex}{ext}"
-            data = f.read(); f.seek(0)
-            supabase.storage.from_(SUPABASE_BUCKET).upload(key, data, {"content-type": f.type})
-            url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(key)
-            out.append({"url": url, "path": key, "filename": f.name, "mimetype": f.type or "image/jpeg", "tipo": tipo})
-        except Exception as e:
-            st.error(f"Falha ao subir {f.name}: {e}")
-    return out
-
-# Inserção antifalha de RNC (tenta números até gravar)
-def insert_rnc_antifalha(conn, payload: dict) -> int:
-    tentativas = 20
-    for i in range(tentativas):
-        num = next_rnc_num_sql(conn)
-        payload2 = dict(payload)
-        payload2["rnc"] = num
-        try:
-            if DB_KIND == "postgresql":
-                # ON CONFLICT evita quebrar, retornando nada caso duplique
-                rid = conn.exec_driver_sql("""
-                    INSERT INTO inspecoes
-                    (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
-                     processo_envolvido, origem, severidade, categoria, acoes, status)
-                    VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
-                    ON CONFLICT (rnc_num) DO NOTHING
-                    RETURNING id
-                """, payload2).scalar()
-                if rid is not None:
-                    return rid
-            else:
-                conn.exec_driver_sql("""
-                    INSERT OR IGNORE INTO inspecoes
-                    (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
-                     processo_envolvido, origem, severidade, categoria, acoes, status)
-                    VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
-                """, payload2)
-                rid = conn.exec_driver_sql("SELECT last_insert_rowid()").scalar()
-                if rid and int(rid) > 0:
-                    return int(rid)
+            c.drawImage(ImageReader(_io.BytesIO(logo)), 30, y-25, width=120, height=25, preserveAspectRatio=True, mask='auto')
         except Exception:
             pass
-        # se não conseguiu, espera um pouco e tenta outro número
-        time.sleep(0.05)
-    raise RuntimeError("Não foi possível gerar um número de RNC único após várias tentativas.")
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(170, y-10, "RNC - RELATÓRIO DE NÃO CONFORMIDADE")
+    y -= 40
 
-# ----------------- UI -----------------
+    def line(label, val):
+        nonlocal y
+        c.setFont("Helvetica-Bold", 10); c.drawString(30, y, f"{label}: ")
+        c.setFont("Helvetica", 10); c.drawString(160, y, str(val or "")); y -= 14
+
+    def block(title, textv):
+        nonlocal y
+        c.setFont("Helvetica-Bold", 11); c.drawString(30, y, title); y -= 12
+        c.setFont("Helvetica", 10)
+        for ln in str(textv or "").splitlines():
+            c.drawString(30, y, ln[:110]); y -= 12
+            if y < 80: c.showPage(); y = H - 30
+        y -= 6
+
+    # Exibe campos
+    line("RNC Nº", irow.get("rnc_num"))
+    line("Data", str(irow.get("data") or "")[:10])
+    line("Emitente", irow.get("emitente"))
+    line("Área/Local", irow.get("area"))
+    line("PEP", irow.get("pep"))
+    line("Categoria", irow.get("categoria"))
+    line("Severidade", irow.get("severidade"))
+    line("Causador / Processo / Origem",
+         f"{irow.get('causador','')} / {irow.get('processo_envolvido','')} / {irow.get('origem','')}")
+    line("Responsável", irow.get("responsavel"))
+
+    y -= 6
+    block("Título", irow.get("titulo"))
+    block("Descrição da não conformidade", irow.get("descricao"))
+    block("Referências", irow.get("referencias"))
+
+    if irow.get("encerrada_em") or irow.get("encerramento_desc") or irow.get("eficacia"):
+        block("Encerramento (observações / descrição / eficácia)",
+              f"{irow.get('encerramento_obs','')}\n{irow.get('encerramento_desc','')}\nEficácia: {irow.get('eficacia','')}")
+    if irow.get("reaberta_em") or irow.get("reabertura_desc") or irow.get("reabertura_motivo"):
+        block("Reabertura (motivo / descrição)",
+              f"{irow.get('reabertura_motivo','')}\n{irow.get('reabertura_desc','')}")
+    if irow.get("status") == "Cancelada":
+        block("Cancelamento", f"Motivo: {irow.get('cancelamento_motivo','')}")
+
+    def draw_fotos(title, lst):
+        nonlocal y
+        if not lst: return
+        c.setFont("Helvetica-Bold", 11); c.drawString(30, y, title); y -= 10
+        x = 30; size = 140; pad = 8; col = 0
+        for fo in lst:
+            try:
+                if fo.get("url"):
+                    import requests
+                    r = requests.get(fo["url"], timeout=8)
+                    img = ImageReader(_io.BytesIO(r.content))
+                else:
+                    img = ImageReader(fo.get("path"))
+                if y - size < 60:
+                    c.showPage(); y = H - 30
+                c.drawImage(img, x, y-size, width=size, height=size, preserveAspectRatio=True, mask='auto')
+            except Exception:
+                pass
+            x += size + pad; col += 1
+            if col == 3:
+                col = 0; x = 30; y -= size + pad
+        y -= size + 10
+
+    draw_fotos("Fotos da abertura", fotos_ab)
+    draw_fotos("Evidências de encerramento", fotos_enc)
+    draw_fotos("Fotos da reabertura", fotos_rea)
+
+    c.showPage(); c.save()
+    buf.seek(0); return buf.read()
+
+# ----------------- APP -----------------
 auth_box()
 menu = st.sidebar.radio("Menu", ["➕ Nova RNC", "🔎 Consultar/Editar", "🏷️ PEPs", "⬇️⬆️ CSV"])
 
-# ----------------- Nova RNC -----------------
+# ➕ Nova RNC
 if menu == "➕ Nova RNC":
     st.title("Nova RNC (RNC Nº automático)")
-    # Preview seguro
+    # Preview do número (best-effort): só mostra formato AAAA-XXX, mas o oficial sai na gravação
     try:
-        with engine.connect() as c:
-            rnc_preview = next_rnc_num_sql(c)
+        with engine.begin() as c:
+            # gera sem gravar, só espelha o próximo provável (não crítico)
+            preview = next_rnc_num_tx(c)
     except Exception:
-        rnc_preview = f"{datetime.now().year}-001"
-
+        preview = f"{datetime.now().year}-???"
     with st.form("form_rnc"):
         col0, col1, col2 = st.columns(3)
         emitente = col0.text_input("Emitente")
         data_insp = col1.date_input("Data", value=date.today())
-        col2.text_input("RNC Nº (automático)", value=rnc_preview, disabled=True)
+        col2.text_input("RNC Nº (automático)", value=preview, disabled=True)
 
         area = st.text_input("Área/Local", placeholder="Ex.: Correia TR-2011KS-07")
         categoria = st.selectbox("Categoria", ["Segurança","Qualidade","Meio Ambiente","Operação","Manutenção","Outros"])
         severidade = st.selectbox("Severidade", ["Baixa","Média","Alta","Crítica"])
-        # PEPs
-        with engine.begin() as c:
-            peps = [r[0] for r in c.exec_driver_sql("SELECT code FROM peps ORDER BY code").fetchall()]
-        pep = st.selectbox("PEP (código — descrição)", options=[""] + peps)
+        pep = st.selectbox("PEP (código — descrição)", options=[""] + list_peps())
 
         causador = st.selectbox("Causador", ["Solda","Pintura","Engenharia","Fornecedor","Cliente","Caldeiraria","Usinagem","Planejamento","Qualidade","RH","Outros"])
         processo = st.selectbox("Processo envolvido", ["Comercial","Compras","Planejamento","Recebimento","Produção","Inspeção Final","Segurança","Meio Ambiente","5S","RH","Outros"])
@@ -371,8 +487,7 @@ if menu == "➕ Nova RNC":
                 "proc": processo, "ori": origem, "sev": severidade, "cat": categoria
             }
             with engine.begin() as conn:
-                new_id = insert_rnc_antifalha(conn, payload)
-                rnc = conn.exec_driver_sql("SELECT rnc_num FROM inspecoes WHERE id=:i", {"i": new_id}).scalar()
+                new_id, rnc = insert_rnc_with_counter(conn, payload)
             metas = upload_photos(fotos_ab or [], rnc, "abertura")
             with engine.begin() as conn:
                 for m in metas:
@@ -382,7 +497,7 @@ if menu == "➕ Nova RNC":
                     """, {"i": new_id, "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
             st.success(f"RNC salva! Nº {rnc} (ID {new_id})")
 
-# ----------------- Consultar/Editar -----------------
+# 🔎 Consultar/Editar
 elif menu == "🔎 Consultar/Editar":
     st.title("Consultar / Editar RNCs")
     df = pd.read_sql("SELECT id, data, rnc_num, titulo, emitente, area, pep, categoria, severidade, status FROM inspecoes ORDER BY id DESC", engine)
@@ -480,7 +595,7 @@ elif menu == "🔎 Consultar/Editar":
             else:
                 st.info("Entre como Qualidade para encerrar/reabrir/cancelar/excluir.")
 
-# ----------------- PEPs -----------------
+# 🏷️ PEPs
 elif menu == "🏷️ PEPs":
     st.title("Gerenciar PEPs")
     dfp = pd.read_sql("SELECT id, code FROM peps ORDER BY code", engine)
@@ -495,11 +610,13 @@ elif menu == "🏷️ PEPs":
                 lst = [str(x) for x in dfp_in['code'].fillna('') if str(x).strip()]
             else:
                 up_pep.seek(0)
-                reader = csv.reader(io.StringIO(up_pep.getvalue().decode('utf-8')))
+                import io as _io, csv as _csv
+                reader = _csv.reader(_io.StringIO(up_pep.getvalue().decode('utf-8')))
                 lst = [row[0] for row in reader if row and str(row[0]).strip()]
         except Exception:
             up_pep.seek(0)
-            reader = csv.reader(io.StringIO(up_pep.getvalue().decode('utf-8')))
+            import io as _io, csv as _csv
+            reader = _csv.reader(_io.StringIO(up_pep.getvalue().decode('utf-8')))
             lst = [row[0] for row in reader if row and str(row[0]).strip()]
         n = add_peps_bulk(lst)
         st.success(f"{n} PEP(s) adicionados.")
@@ -515,7 +632,7 @@ elif menu == "🏷️ PEPs":
         n = add_peps_bulk([c])
         st.success(f"{n} adicionado(s).")
 
-# ----------------- CSV -----------------
+# ⬇️⬆️ CSV
 elif menu == "⬇️⬆️ CSV":
     st.title("Importar / Exportar CSV de RNCs")
     df_all = pd.read_sql("SELECT * FROM inspecoes ORDER BY id DESC", engine)
@@ -559,10 +676,9 @@ elif menu == "⬇️⬆️ CSV":
                 if dc in imp2.columns:
                     imp2[dc] = imp2[dc].apply(norm_dt)
 
-            inserted, auto_num = 0, 0
+            inserted, auto_num, honored = 0, 0, 0
             with engine.begin() as conn:
                 for _, r in imp2.fillna("").iterrows():
-                    # monta payload básico (sem rnc_num, que podemos gerar)
                     payload = {
                         "data": r.get("data") if "data" in cols else None,
                         "emit": r.get("emitente") if "emitente" in cols else None,
@@ -577,7 +693,6 @@ elif menu == "⬇️⬆️ CSV":
                         "sev": r.get("severidade") if "severidade" in cols else None,
                         "cat": r.get("categoria") if "categoria" in cols else None,
                     }
-                    # tenta honrar rnc_num do CSV; se faltar ou conflitar, gera automático
                     csv_num = str(r.get("rnc_num")).strip() if "rnc_num" in cols else ""
                     rid = None
                     if csv_num:
@@ -589,22 +704,22 @@ elif menu == "⬇️⬆️ CSV":
                                      processo_envolvido, origem, severidade, categoria, acoes, status)
                                     VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
                                     ON CONFLICT (rnc_num) DO NOTHING
-                                    RETURNING id
+                                    RETURNING id;
                                 """, dict(payload, rnc=csv_num)).scalar()
+                                if rid is not None: honored += 1
                             else:
                                 conn.exec_driver_sql("""
                                     INSERT OR IGNORE INTO inspecoes
                                     (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
                                      processo_envolvido, origem, severidade, categoria, acoes, status)
-                                    VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
+                                    VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta');
                                 """, dict(payload, rnc=csv_num))
-                                rid = conn.exec_driver_sql("SELECT last_insert_rowid()").scalar()
-                                rid = int(rid) if rid else None
+                                lrid = conn.exec_driver_sql("SELECT last_insert_rowid()").scalar()
+                                if lrid and int(lrid) > 0: honored += 1; rid = int(lrid)
                         except Exception:
                             rid = None
                     if not rid:
-                        # gera automático
-                        rid = insert_rnc_antifalha(conn, payload)
+                        rid, auto = insert_rnc_with_counter(conn, payload)
                         auto_num += 1
                     inserted += 1
-            st.success(f"Importação concluída. {inserted} linha(s). {auto_num} número(s) de RNC gerados automaticamente.")
+            st.success(f"Importação concluída. Inseridos: {inserted}. Respeitados do CSV: {honored}. Gerados automaticamente: {auto_num}.")
