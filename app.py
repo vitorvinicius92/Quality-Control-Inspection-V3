@@ -1,5 +1,5 @@
 
-import os, io, re, ssl, smtplib, tempfile, requests, uuid
+import os, io, re, ssl, smtplib, tempfile, requests, uuid, traceback
 from email.message import EmailMessage
 from datetime import datetime, date
 import pandas as pd
@@ -15,8 +15,9 @@ except Exception:
     create_client = None
     Client = None
 
-# ====== Estilos ======
-CUSTOM_CSS = """
+# ====== Estilo / Página ======
+st.set_page_config(page_title="RNC — v08 (Supabase + Fallback)", page_icon="📝", layout="wide")
+st.markdown("""
 <style>
 .block-container{max-width:1200px; padding-top:1rem;}
 .stButton>button{background:#0a7b83; color:#fff; border:0; border-radius:12px; padding:10px 16px; font-weight:600;}
@@ -24,20 +25,15 @@ CUSTOM_CSS = """
 .stExpander{border:1px solid #e2e8f0; border-radius:12px;}
 [data-testid='stMetricValue']{color:#0a7b83;}
 </style>
-"""
-st.set_page_config(page_title="RNC — v08 (Supabase)", page_icon="📝", layout="wide")
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
-# ====== Variáveis de ambiente (configure em Secrets) ======
+# ====== Secrets ======
 QUALITY_PASS = os.getenv("QUALITY_PASS", "qualidade123")
-
-# Supabase: chaves e bucket
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")  # postgres://... (Dashboard > Project Settings > Database)
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "rnc-fotos")
 
-# E-mail (opcional)
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
@@ -45,11 +41,39 @@ SMTP_PASS = os.getenv("SMTP_PASS", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")
 EMAIL_TO = [e.strip() for e in os.getenv("EMAIL_TO", "").split(",") if e.strip()]
 
-# ====== Conexões ======
+# ====== Conexão com fallback ======
+def _test_engine(db_url: str):
+    eng = create_engine(db_url, poolclass=NullPool, future=True)
+    with eng.connect() as conn:
+        conn.exec_driver_sql("SELECT 1;")
+    return eng
+
 def get_db_engine():
-    # Prioriza Supabase Postgres; se não tiver, cai para SQLite (local)
-    db_url = SUPABASE_DB_URL or "sqlite:///rnc.db"
-    return create_engine(db_url, poolclass=NullPool, future=True)
+    # 1) Tenta Supabase (se informado)
+    if SUPABASE_DB_URL:
+        try:
+            eng = _test_engine(SUPABASE_DB_URL)
+            st.info("🔌 Banco: conectado ao Supabase com sucesso.")
+            return eng
+        except Exception as e:
+            st.error("❌ Não foi possível conectar ao Supabase. Usando SQLite local para não te travar.")
+            with st.expander("Ver detalhes técnicos (corrija os secrets e recarregue)"):
+                st.code(f"""SUPABASE_DB_URL = {SUPABASE_DB_URL}
+
+Erro:
+{type(e).__name__}: {e}
+
+Traceback:
+{traceback.format_exc()}
+""", language="bash")
+    # 2) Fallback: SQLite
+    try:
+        eng = _test_engine("sqlite:///rnc.db")
+        st.warning("⚠️ Usando banco local (SQLite). Ajuste o SUPABASE_DB_URL e recarregue para conectar ao Supabase.")
+        return eng
+    except Exception as e:
+        st.exception(e)
+        st.stop()
 
 engine = get_db_engine()
 
@@ -63,114 +87,116 @@ def get_supabase():
 
 supabase = get_supabase()
 
-# ====== DB & Migrações (Postgres/SQLite) ======
+# ====== DB & Migrações ======
 def init_db():
     with engine.begin() as conn:
-        # Tabela principal
-        conn.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS inspecoes (
-            id BIGSERIAL PRIMARY KEY,
-            data TIMESTAMPTZ NULL,
-            rnc_num TEXT,
-            emitente TEXT,
-            area TEXT,
-            pep TEXT,
-            titulo TEXT,
-            responsavel TEXT,
-            descricao TEXT,
-            referencias TEXT,
-            causador TEXT,
-            processo_envolvido TEXT,
-            origem TEXT,
-            acao_correcao TEXT,
-            severidade TEXT,
-            categoria TEXT,
-            acoes TEXT,
-            status TEXT DEFAULT 'Aberta',
-            encerrada_em TIMESTAMPTZ NULL,
-            encerrada_por TEXT,
-            encerramento_obs TEXT,
-            eficacia TEXT,
-            responsavel_acao TEXT,
-            reaberta_em TIMESTAMPTZ NULL,
-            reaberta_por TEXT,
-            reabertura_motivo TEXT,
-            encerramento_desc TEXT,
-            reabertura_desc TEXT,
-            cancelada_em TIMESTAMPTZ NULL,
-            cancelada_por TEXT,
-            cancelamento_motivo TEXT
-        );
-        """.replace("BIGSERIAL", "INTEGER").replace("TIMESTAMPTZ", "TIMESTAMP") if engine.url.get_backend_name()=="sqlite" else """
-        CREATE TABLE IF NOT EXISTS inspecoes (
-            id BIGSERIAL PRIMARY KEY,
-            data TIMESTAMPTZ NULL,
-            rnc_num TEXT,
-            emitente TEXT,
-            area TEXT,
-            pep TEXT,
-            titulo TEXT,
-            responsavel TEXT,
-            descricao TEXT,
-            referencias TEXT,
-            causador TEXT,
-            processo_envolvido TEXT,
-            origem TEXT,
-            acao_correcao TEXT,
-            severidade TEXT,
-            categoria TEXT,
-            acoes TEXT,
-            status TEXT DEFAULT 'Aberta',
-            encerrada_em TIMESTAMPTZ NULL,
-            encerrada_por TEXT,
-            encerramento_obs TEXT,
-            eficacia TEXT,
-            responsavel_acao TEXT,
-            reaberta_em TIMESTAMPTZ NULL,
-            reaberta_por TEXT,
-            reabertura_motivo TEXT,
-            encerramento_desc TEXT,
-            reabertura_desc TEXT,
-            cancelada_em TIMESTAMPTZ NULL,
-            cancelada_por TEXT,
-            cancelamento_motivo TEXT
-        );
-        """)
-        # Fotos: guardamos apenas URLs do Storage
-        conn.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS fotos (
-            id BIGSERIAL PRIMARY KEY,
-            inspecao_id BIGINT NOT NULL,
-            url TEXT,
-            path TEXT,
-            filename TEXT,
-            mimetype TEXT,
-            tipo TEXT,
-            CONSTRAINT fotos_tipo CHECK (tipo IN ('abertura','encerramento','reabertura'))
-        );
-        """.replace("BIGSERIAL", "INTEGER").replace("BIGINT","INTEGER") if engine.url.get_backend_name()=="sqlite" else """
-        CREATE TABLE IF NOT EXISTS fotos (
-            id BIGSERIAL PRIMARY KEY,
-            inspecao_id BIGINT NOT NULL,
-            url TEXT,
-            path TEXT,
-            filename TEXT,
-            mimetype TEXT,
-            tipo TEXT CHECK (tipo IN ('abertura','encerramento','reabertura'))
-        );
-        """)
-        # PEPs
-        conn.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS peps (id BIGSERIAL PRIMARY KEY, code TEXT UNIQUE);
-        """.replace("BIGSERIAL","INTEGER") if engine.url.get_backend_name()=="sqlite" else """
-        CREATE TABLE IF NOT EXISTS peps (id BIGSERIAL PRIMARY KEY, code TEXT UNIQUE);
-        """)
-        # Settings (logo)
-        conn.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, blob BYTEA, text TEXT);
-        """.replace("BYTEA","BLOB") if engine.url.get_backend_name()=="sqlite" else """
-        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, blob BYTEA, text TEXT);
-        """)
+        # Tabela principal (compatível com SQLite e Postgres)
+        if engine.url.get_backend_name() == "sqlite":
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS inspecoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data TIMESTAMP NULL,
+                rnc_num TEXT,
+                emitente TEXT,
+                area TEXT,
+                pep TEXT,
+                titulo TEXT,
+                responsavel TEXT,
+                descricao TEXT,
+                referencias TEXT,
+                causador TEXT,
+                processo_envolvido TEXT,
+                origem TEXT,
+                acao_correcao TEXT,
+                severidade TEXT,
+                categoria TEXT,
+                acoes TEXT,
+                status TEXT DEFAULT 'Aberta',
+                encerrada_em TIMESTAMP NULL,
+                encerrada_por TEXT,
+                encerramento_obs TEXT,
+                eficacia TEXT,
+                responsavel_acao TEXT,
+                reaberta_em TIMESTAMP NULL,
+                reaberta_por TEXT,
+                reabertura_motivo TEXT,
+                encerramento_desc TEXT,
+                reabertura_desc TEXT,
+                cancelada_em TIMESTAMP NULL,
+                cancelada_por TEXT,
+                cancelamento_motivo TEXT
+            );
+            """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS fotos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                inspecao_id INTEGER NOT NULL,
+                url TEXT,
+                path TEXT,
+                filename TEXT,
+                mimetype TEXT,
+                tipo TEXT
+            );
+            """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS peps (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE);
+            """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, blob BLOB, text TEXT);
+            """)
+        else:
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS inspecoes (
+                id BIGSERIAL PRIMARY KEY,
+                data TIMESTAMPTZ NULL,
+                rnc_num TEXT,
+                emitente TEXT,
+                area TEXT,
+                pep TEXT,
+                titulo TEXT,
+                responsavel TEXT,
+                descricao TEXT,
+                referencias TEXT,
+                causador TEXT,
+                processo_envolvido TEXT,
+                origem TEXT,
+                acao_correcao TEXT,
+                severidade TEXT,
+                categoria TEXT,
+                acoes TEXT,
+                status TEXT DEFAULT 'Aberta',
+                encerrada_em TIMESTAMPTZ NULL,
+                encerrada_por TEXT,
+                encerramento_obs TEXT,
+                eficacia TEXT,
+                responsavel_acao TEXT,
+                reaberta_em TIMESTAMPTZ NULL,
+                reaberta_por TEXT,
+                reabertura_motivo TEXT,
+                encerramento_desc TEXT,
+                reabertura_desc TEXT,
+                cancelada_em TIMESTAMPTZ NULL,
+                cancelada_por TEXT,
+                cancelamento_motivo TEXT
+            );
+            """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS fotos (
+                id BIGSERIAL PRIMARY KEY,
+                inspecao_id BIGINT NOT NULL,
+                url TEXT,
+                path TEXT,
+                filename TEXT,
+                mimetype TEXT,
+                tipo TEXT CHECK (tipo IN ('abertura','encerramento','reabertura'))
+            );
+            """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS peps (id BIGSERIAL PRIMARY KEY, code TEXT UNIQUE);
+            """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, blob BYTEA, text TEXT);
+            """)
 
 init_db()
 
@@ -215,8 +241,17 @@ def add_peps_bulk(codes:list):
     return ins
 
 # ====== Supabase Storage (fotos) ======
+def get_supabase_client():
+    if not (SUPABASE_URL and SUPABASE_KEY and create_client):
+        return None
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        return None
+
+supabase = get_supabase_client()
+
 def storage_upload_images(files, tipo: str, rnc_num: str):
-    """Sobe imagens p/ Supabase Storage e retorna lista de dicts {url, path, filename, mimetype}"""
     out = []
     if not files: return out
     if not supabase:
@@ -242,7 +277,7 @@ def storage_upload_images(files, tipo: str, rnc_num: str):
             st.error(f"Falha ao subir {f.name}: {e}")
     return out
 
-# ====== Core ======
+# ====== Core: CRUD ======
 def next_rnc_num_for_date(d:date) -> str:
     year = d.year
     with engine.begin() as conn:
@@ -250,7 +285,7 @@ def next_rnc_num_for_date(d:date) -> str:
     seqs = []
     for (val,) in rows:
         if not val: continue
-        m = re.match(rf"^{year}-(\\d+)$", str(val).strip())
+        m = re.match(rf"^{year}-(\d+)$", str(val).strip())
         if m:
             try: seqs.append(int(m.group(1)))
             except: pass
@@ -345,7 +380,6 @@ def cancel_inspecao(iid:int, por:str, motivo:str):
         """), {"dt": datetime.now(), "por": por, "motivo": motivo, "iid": iid})
 
 def delete_inspecao(iid:int):
-    # remove registros do DB; as fotos permanecem no Storage (boa prática para auditoria)
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM fotos WHERE inspecao_id=:iid"), {"iid": iid})
         conn.execute(text("DELETE FROM inspecoes WHERE id=:iid"), {"iid": iid})
@@ -464,7 +498,7 @@ def generate_pdf(iid:int) -> str:
         y = draw_block("Cancelamento — motivo:", row.get("cancelamento_motivo"), y - 8*mm)
         y = draw_block("Cancelada por / Em:", (row.get("cancelada_por") or "-") + " / " + str(row.get("cancelada_em") or "-"), y - 6*mm)
 
-    # Fotos (baixadas por URL)
+    # Fotos (via URL)
     def draw_images(urls, titulo):
         nonlocal y
         if not urls: return
@@ -816,8 +850,7 @@ elif menu == "Gerenciar PEPs":
                 n = add_peps_bulk(df_csv["code"].astype(str).tolist())
                 st.success(str(n) + " PEP(s) importado(s).")
             else:
-                st.error("CSV deve conter uma coluna chamada 'code'.")
-    # Lista
+                st.error("CSV deve conter uma coluna chamado 'code'.")
     with engine.begin() as conn:
         df_pep = pd.read_sql(text('SELECT code AS "PEP — descrição" FROM peps ORDER BY code'), conn)
     st.dataframe(df_pep, use_container_width=True, hide_index=True)
