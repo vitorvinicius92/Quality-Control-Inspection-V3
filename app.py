@@ -1,15 +1,15 @@
 
 import os, io, uuid, traceback, csv, time
 from datetime import datetime, date
-from typing import List, Optional
+from typing import Optional
 
 import streamlit as st
 import pandas as pd
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-# Supabase
+# Supabase (para fotos)
 try:
     from supabase import create_client
 except Exception:
@@ -20,16 +20,17 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-BUILD_TAG = "v08-v6.1-ddl-fix"
+BUILD_TAG = "v08-v6.2-supabase-counter-fix"
 
 st.set_page_config(page_title=f"RNC — {BUILD_TAG}", page_icon="📝", layout="wide")
 
 # ----------------- Secrets / Env -----------------
-SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "")
+SUPABASE_URL    = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY    = os.getenv("SUPABASE_KEY", "")
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "RNC-FOTOS")
-QUALITY_PASS = os.getenv("QUALITY_PASS", "qualidade123")
+QUALITY_PASS    = os.getenv("QUALITY_PASS", "qualidade123")
+INIT_DB_FLAG    = os.getenv("INIT_DB", "true").lower() == "true"  # permite pular migração
 
 # ----------------- Conexões -----------------
 def get_engine():
@@ -63,155 +64,172 @@ DB_KIND = engine.url.get_backend_name()
 supabase = get_supabase()
 
 # ----------------- Migrações -----------------
-def try_sql(conn, sql: str, ctx: str):
+def try_sql(conn, sql: str):
     try:
         conn.exec_driver_sql(sql)
-        return True, None
+        return None
     except Exception as e:
-        return False, f"{ctx}: {type(e).__name__}: {e}"
+        return f"{type(e).__name__}: {e}"
 
 def init_db():
     with engine.begin() as conn:
         if DB_KIND == "postgresql":
-            # 1) Garante search_path
-            ok, err = try_sql(conn, "SET search_path TO public;", "SET search_path public")
-            if not ok:
-                st.warning("Não consegui setar schema para 'public'. Tentarei 'app'.")
-                try_sql(conn, "CREATE SCHEMA IF NOT EXISTS app;", "CREATE SCHEMA app")
-                try_sql(conn, "SET search_path TO app, public;", "SET search_path app")
+            # tenta usar public; se falhar, usa schema app
+            err = try_sql(conn, "SET search_path TO public;")
+            if err:
+                try_sql(conn, "CREATE SCHEMA IF NOT EXISTS app;")
+                try_sql(conn, "SET search_path TO app, public;")
 
-            # 2) Criações (cada uma isolada)
-            pieces = [
-                ("CREATE TABLE IF NOT EXISTS inspecoes (\n"
-                 " id BIGSERIAL PRIMARY KEY,\n"
-                 " data TIMESTAMP NULL,\n"
-                 " rnc_num TEXT,\n"
-                 " emitente TEXT,\n"
-                 " area TEXT,\n"
-                 " pep TEXT,\n"
-                 " titulo TEXT,\n"
-                 " responsavel TEXT,\n"
-                 " descricao TEXT,\n"
-                 " referencias TEXT,\n"
-                 " causador TEXT,\n"
-                 " processo_envolvido TEXT,\n"
-                 " origem TEXT,\n"
-                 " severidade TEXT,\n"
-                 " categoria TEXT,\n"
-                 " acoes TEXT,\n"
-                 " status TEXT DEFAULT 'Aberta',\n"
-                 " encerrada_em TIMESTAMP NULL,\n"
-                 " encerrada_por TEXT,\n"
-                 " encerramento_obs TEXT,\n"
-                 " encerramento_desc TEXT,\n"
-                 " eficacia TEXT,\n"
-                 " responsavel_acao TEXT,\n"
-                 " reaberta_em TIMESTAMP NULL,\n"
-                 " reaberta_por TEXT,\n"
-                 " reabertura_motivo TEXT,\n"
-                 " reabertura_desc TEXT,\n"
-                 " cancelada_em TIMESTAMP NULL,\n"
-                 " cancelada_por TEXT,\n"
-                 " cancelamento_motivo TEXT\n"
-                 ");", "CREATE TABLE inspecoes"),
-                ("CREATE TABLE IF NOT EXISTS fotos (\n"
-                 " id BIGSERIAL PRIMARY KEY,\n"
-                 " inspecao_id BIGINT NOT NULL,\n"
-                 " tipo TEXT,\n"
-                 " url TEXT,\n"
-                 " path TEXT,\n"
-                 " filename TEXT,\n"
-                 " mimetype TEXT\n"
-                 ");", "CREATE TABLE fotos"),
-                ("CREATE TABLE IF NOT EXISTS peps (\n"
-                 " id BIGSERIAL PRIMARY KEY,\n"
-                 " code TEXT UNIQUE\n"
-                 ");", "CREATE TABLE peps"),
-                ("CREATE TABLE IF NOT EXISTS settings (\n"
-                 " key TEXT PRIMARY KEY,\n"
-                 " blob BYTEA,\n"
-                 " text TEXT\n"
-                 ");", "CREATE TABLE settings"),
-                ("CREATE TABLE IF NOT EXISTS rnc_counters (\n"
-                 " year INTEGER PRIMARY KEY,\n"
-                 " last_seq INTEGER NOT NULL\n"
-                 ");", "CREATE TABLE rnc_counters"),
-                ("CREATE UNIQUE INDEX IF NOT EXISTS uidx_inspecoes_rnc ON inspecoes (rnc_num);", "CREATE INDEX uidx_inspecoes_rnc"),
-            ]
             diag = []
-            for sql, ctx in pieces:
-                ok, err = try_sql(conn, sql, ctx)
-                if not ok: diag.append(err)
-
+            for sql in [
+                """
+                CREATE TABLE IF NOT EXISTS inspecoes (
+                    id BIGSERIAL PRIMARY KEY,
+                    data TIMESTAMP NULL,
+                    rnc_num TEXT,
+                    emitente TEXT,
+                    area TEXT,
+                    pep TEXT,
+                    titulo TEXT,
+                    responsavel TEXT,
+                    descricao TEXT,
+                    referencias TEXT,
+                    causador TEXT,
+                    processo_envolvido TEXT,
+                    origem TEXT,
+                    severidade TEXT,
+                    categoria TEXT,
+                    acoes TEXT,
+                    status TEXT DEFAULT 'Aberta',
+                    encerrada_em TIMESTAMP NULL,
+                    encerrada_por TEXT,
+                    encerramento_obs TEXT,
+                    encerramento_desc TEXT,
+                    eficacia TEXT,
+                    responsavel_acao TEXT,
+                    reaberta_em TIMESTAMP NULL,
+                    reaberta_por TEXT,
+                    reabertura_motivo TEXT,
+                    reabertura_desc TEXT,
+                    cancelada_em TIMESTAMP NULL,
+                    cancelada_por TEXT,
+                    cancelamento_motivo TEXT
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS fotos (
+                    id BIGSERIAL PRIMARY KEY,
+                    inspecao_id BIGINT NOT NULL,
+                    tipo TEXT,
+                    url TEXT,
+                    path TEXT,
+                    filename TEXT,
+                    mimetype TEXT
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS peps (
+                    id BIGSERIAL PRIMARY KEY,
+                    code TEXT UNIQUE
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    blob BYTEA,
+                    text TEXT
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS rnc_counters (
+                    year INTEGER PRIMARY KEY,
+                    last_seq INTEGER NOT NULL
+                );
+                """,
+                "CREATE UNIQUE INDEX IF NOT EXISTS uidx_inspecoes_rnc ON inspecoes (rnc_num);",
+            ]:
+                er = try_sql(conn, sql)
+                if er: diag.append(er)
             if diag:
                 with st.expander("📋 Diagnóstico de migração (Postgres)"):
                     st.code("\n".join(diag))
         else:
             # SQLite
-            try_sql(conn, """
-            CREATE TABLE IF NOT EXISTS inspecoes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                data TIMESTAMP NULL,
-                rnc_num TEXT,
-                emitente TEXT,
-                area TEXT,
-                pep TEXT,
-                titulo TEXT,
-                responsavel TEXT,
-                descricao TEXT,
-                referencias TEXT,
-                causador TEXT,
-                processo_envolvido TEXT,
-                origem TEXT,
-                severidade TEXT,
-                categoria TEXT,
-                acoes TEXT,
-                status TEXT DEFAULT 'Aberta',
-                encerrada_em TIMESTAMP NULL,
-                encerrada_por TEXT,
-                encerramento_obs TEXT,
-                encerramento_desc TEXT,
-                eficacia TEXT,
-                responsavel_acao TEXT,
-                reaberta_em TIMESTAMP NULL,
-                reaberta_por TEXT,
-                reabertura_motivo TEXT,
-                reabertura_desc TEXT,
-                cancelada_em TIMESTAMP NULL,
-                cancelada_por TEXT,
-                cancelamento_motivo TEXT
-            );""", "CREATE TABLE inspecoes (sqlite)")
-            try_sql(conn, """
-            CREATE TABLE IF NOT EXISTS fotos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                inspecao_id INTEGER NOT NULL,
-                tipo TEXT,
-                url TEXT,
-                path TEXT,
-                filename TEXT,
-                mimetype TEXT
-            );""", "CREATE TABLE fotos (sqlite)")
-            try_sql(conn, """
-            CREATE TABLE IF NOT EXISTS peps (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE
-            );""", "CREATE TABLE peps (sqlite)")
-            try_sql(conn, """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                blob BLOB,
-                text TEXT
-            );""", "CREATE TABLE settings (sqlite)")
-            try_sql(conn, """
-            CREATE TABLE IF NOT EXISTS rnc_counters (
-                year INTEGER PRIMARY KEY,
-                last_seq INTEGER NOT NULL
-            );""", "CREATE TABLE rnc_counters (sqlite)")
-            try_sql(conn, "CREATE UNIQUE INDEX IF NOT EXISTS uidx_inspecoes_rnc ON inspecoes (rnc_num);", "CREATE INDEX uidx (sqlite)")
+            stmts = [
+                """
+                CREATE TABLE IF NOT EXISTS inspecoes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    data TIMESTAMP NULL,
+                    rnc_num TEXT,
+                    emitente TEXT,
+                    area TEXT,
+                    pep TEXT,
+                    titulo TEXT,
+                    responsavel TEXT,
+                    descricao TEXT,
+                    referencias TEXT,
+                    causador TEXT,
+                    processo_envolvido TEXT,
+                    origem TEXT,
+                    severidade TEXT,
+                    categoria TEXT,
+                    acoes TEXT,
+                    status TEXT DEFAULT 'Aberta',
+                    encerrada_em TIMESTAMP NULL,
+                    encerrada_por TEXT,
+                    encerramento_obs TEXT,
+                    encerramento_desc TEXT,
+                    eficacia TEXT,
+                    responsavel_acao TEXT,
+                    reaberta_em TIMESTAMP NULL,
+                    reaberta_por TEXT,
+                    reabertura_motivo TEXT,
+                    reabertura_desc TEXT,
+                    cancelada_em TIMESTAMP NULL,
+                    cancelada_por TEXT,
+                    cancelamento_motivo TEXT
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS fotos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    inspecao_id INTEGER NOT NULL,
+                    tipo TEXT,
+                    url TEXT,
+                    path TEXT,
+                    filename TEXT,
+                    mimetype TEXT
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS peps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT UNIQUE
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    blob BLOB,
+                    text TEXT
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS rnc_counters (
+                    year INTEGER PRIMARY KEY,
+                    last_seq INTEGER NOT NULL
+                );
+                """,
+                "CREATE UNIQUE INDEX IF NOT EXISTS uidx_inspecoes_rnc ON inspecoes (rnc_num);",
+            ]
+            for s in stmts:
+                try_sql(conn, s)
 
-init_db()
+# roda migração só se permitido
+if INIT_DB_FLAG:
+    init_db()
 
-# ----------------- Helpers / resto do app -----------------
+# ----------------- Helpers -----------------
 def is_quality() -> bool:
     return st.session_state.get("is_quality", False)
 
@@ -282,28 +300,29 @@ def upload_photos(files, rnc_num: str, tipo: str):
             st.error(f"Falha ao subir {f.name}: {e}")
     return out
 
-# ---------- Contador por ano (única fonte) ----------
+# ---------- Contador por ano (fix alias e seq inicial = 1) ----------
 def next_rnc_num_tx(conn) -> str:
     y = int(datetime.now().year)
     if DB_KIND == "postgresql":
         seq = conn.exec_driver_sql("""
-            INSERT INTO rnc_counters AS rc(year, last_seq)
-            VALUES (:y, 0)
-            ON CONFLICT (year) DO UPDATE SET last_seq = rc.last_seq + 1
+            INSERT INTO rnc_counters (year, last_seq)
+            VALUES (:y, 1)
+            ON CONFLICT (year)
+            DO UPDATE SET last_seq = rnc_counters.last_seq + 1
             RETURNING last_seq;
         """, {"y": y}).scalar_one()
     else:
         try:
             seq = conn.exec_driver_sql("""
-                INSERT INTO rnc_counters(year, last_seq) VALUES (:y, 0)
+                INSERT INTO rnc_counters(year, last_seq) VALUES (:y, 1)
                 ON CONFLICT(year) DO UPDATE SET last_seq = last_seq + 1
                 RETURNING last_seq;
             """, {"y": y}).scalar_one()
         except Exception:
             row = conn.exec_driver_sql("SELECT last_seq FROM rnc_counters WHERE year=:y", {"y": y}).fetchone()
             if row is None:
-                conn.exec_driver_sql("INSERT INTO rnc_counters(year, last_seq) VALUES (:y, 0)", {"y": y})
-                seq = 0
+                conn.exec_driver_sql("INSERT INTO rnc_counters(year, last_seq) VALUES (:y, 1)", {"y": y})
+                seq = 1
             else:
                 seq = int(row[0]) + 1
                 conn.exec_driver_sql("UPDATE rnc_counters SET last_seq=:s WHERE year=:y", {"s": seq, "y": y})
@@ -341,6 +360,105 @@ def insert_rnc_with_counter(conn, payload: dict):
         time.sleep(0.02)
     raise RuntimeError("Não foi possível alocar número de RNC.")
 
+# ----------------- PDF -----------------
+def generate_pdf(irow, fotos_ab, fotos_enc, fotos_rea):
+    import io as _io, requests
+    buf = _io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    W, H = A4
+    y = H - 30
+
+    try:
+        logo = get_logo()
+        if logo:
+            c.drawImage(ImageReader(_io.BytesIO(logo)), 30, y-25, width=120, height=25, preserveAspectRatio=True, mask='auto')
+    except Exception:
+        pass
+
+    try:
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(170, y-10, "RNC - RELATÓRIO DE NÃO CONFORMIDADE")
+    except Exception:
+        pass
+    y -= 40
+
+    def line(label, val):
+        nonlocal y
+        try:
+            c.setFont("Helvetica-Bold", 10); c.drawString(30, y, f"{label}: ")
+            c.setFont("Helvetica", 10); c.drawString(160, y, str(val or "")); y -= 14
+        except Exception:
+            y -= 14
+
+    def block(title, textv):
+        nonlocal y
+        try:
+            c.setFont("Helvetica-Bold", 11); c.drawString(30, y, title); y -= 12
+            c.setFont("Helvetica", 10)
+            for ln in str(textv or "").splitlines():
+                c.drawString(30, y, ln[:110]); y -= 12
+                if y < 80: c.showPage(); y = H - 30
+            y -= 6
+        except Exception:
+            y -= 6
+
+    line("RNC Nº", irow.get("rnc_num"))
+    line("Data", str(irow.get("data") or "")[:10])
+    line("Emitente", irow.get("emitente"))
+    line("Área/Local", irow.get("area"))
+    line("PEP", irow.get("pep"))
+    line("Categoria", irow.get("categoria"))
+    line("Severidade", irow.get("severidade"))
+    line("Causador / Processo / Origem",
+         f"{irow.get('causador','')} / {irow.get('processo_envolvido','')} / {irow.get('origem','')}")
+    line("Responsável", irow.get("responsavel"))
+
+    block("Título", irow.get("titulo"))
+    block("Descrição da não conformidade", irow.get("descricao"))
+    block("Referências", irow.get("referencias"))
+
+    if irow.get("encerrada_em") or irow.get("encerramento_desc") or irow.get("eficacia"):
+        block("Encerramento (observações / descrição / eficácia)",
+              f"{irow.get('encerramento_obs','')}\n{irow.get('encerramento_desc','')}\nEficácia: {irow.get('eficacia','')}")
+    if irow.get("reaberta_em") or irow.get("reabertura_desc") or irow.get("reabertura_motivo"):
+        block("Reabertura (motivo / descrição)",
+              f"{irow.get('reabertura_motivo','')}\n{irow.get('reabertura_desc','')}")
+    if irow.get("status") == "Cancelada":
+        block("Cancelamento", f"Motivo: {irow.get('cancelamento_motivo','')}")
+
+    def draw_fotos(title, lst):
+        nonlocal y
+        if not lst: return
+        try:
+            c.setFont("Helvetica-Bold", 11); c.drawString(30, y, title); y -= 10
+            x = 30; size = 140; pad = 8; col = 0
+            for fo in lst:
+                try:
+                    if fo.get("url"):
+                        import requests
+                        r = requests.get(fo["url"], timeout=8)
+                        img = ImageReader(_io.BytesIO(r.content))
+                    else:
+                        img = ImageReader(fo.get("path"))
+                    if y - size < 60:
+                        c.showPage(); y = H - 30
+                    c.drawImage(img, x, y-size, width=size, height=size, preserveAspectRatio=True, mask='auto')
+                except Exception:
+                    pass
+                x += size + pad; col += 1
+                if col == 3:
+                    col = 0; x = 30; y -= size + pad
+            y -= size + 10
+        except Exception:
+            pass
+
+    draw_fotos("Fotos da abertura", fotos_ab)
+    draw_fotos("Evidências de encerramento", fotos_enc)
+    draw_fotos("Fotos da reabertura", fotos_rea)
+
+    c.showPage(); c.save()
+    buf.seek(0); return buf.read()
+
 # ----------------- UI -----------------
 def list_peps():
     with engine.begin() as c:
@@ -361,17 +479,6 @@ def add_peps_bulk(codes):
             except Exception:
                 pass
     return ok
-
-def set_logo(image_bytes: bytes):
-    with engine.begin() as conn:
-        if DB_KIND == "postgresql":
-            conn.exec_driver_sql("INSERT INTO settings(key, blob) VALUES('logo', :b) ON CONFLICT (key) DO UPDATE SET blob=EXCLUDED.blob", {"b": image_bytes})
-        else:
-            conn.exec_driver_sql("INSERT OR REPLACE INTO settings(key, blob) VALUES('logo', :b)", {"b": image_bytes})
-
-def clear_logo():
-    with engine.begin() as conn:
-        conn.exec_driver_sql("DELETE FROM settings WHERE key='logo'")
 
 auth_box()
 menu = st.sidebar.radio("Menu", ["➕ Nova RNC", "🔎 Consultar/Editar", "🏷️ PEPs", "⬇️⬆️ CSV", "ℹ️ Status"])
@@ -655,7 +762,7 @@ elif menu == "ℹ️ Status":
     st.write(f"**Build:** {BUILD_TAG}")
     st.write(f"**DB:** {DB_KIND}")
     st.write("**Variáveis:**")
-    st.code(f"SUPABASE_URL={'set' if bool(SUPABASE_URL) else 'not set'}; SUPABASE_DB_URL={'set' if bool(SUPABASE_DB_URL) else 'not set'}; SUPABASE_BUCKET={SUPABASE_BUCKET}")
+    st.code(f"SUPABASE_URL={'set' if bool(SUPABASE_URL) else 'not set'}; SUPABASE_DB_URL={'set' if bool(SUPABASE_DB_URL) else 'not set'}; SUPABASE_BUCKET={SUPABASE_BUCKET}; INIT_DB={str(INIT_DB_FLAG)}")
     try:
         with engine.connect() as c:
             v = c.exec_driver_sql("SELECT CURRENT_DATE").scalar()
