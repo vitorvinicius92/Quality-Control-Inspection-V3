@@ -24,14 +24,13 @@ from reportlab.lib.utils import ImageReader
 import smtplib
 from email.message import EmailMessage
 
-st.set_page_config(page_title="RNC v08 — Completo (PG fix)", page_icon="📝", layout="wide")
+st.set_page_config(page_title="RNC v08 — Completo (PG fix v2)", page_icon="📝", layout="wide")
 
 # ----------------- Secrets / Env -----------------
 SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "")
-SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")  # pooler
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "RNC-FOTOS")
-
 QUALITY_PASS = os.getenv("QUALITY_PASS", "qualidade123")
 
 # Email (opcional)
@@ -70,15 +69,13 @@ def get_supabase():
         return None
 
 engine = get_engine()
+DB_KIND = engine.url.get_backend_name()
 supabase = get_supabase()
-
-def is_pg() -> bool:
-    return engine.url.get_backend_name().startswith("postgres")
 
 # ----------------- Migrações -----------------
 def init_db():
     with engine.begin() as conn:
-        if is_pg():
+        if DB_KIND == "postgresql":
             conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS inspecoes (
                 id BIGSERIAL PRIMARY KEY,
@@ -243,7 +240,7 @@ def add_peps_bulk(codes: List[str]) -> int:
             c = c.strip()
             if not c: continue
             try:
-                if is_pg():
+                if DB_KIND == "postgresql":
                     conn.exec_driver_sql("INSERT INTO peps(code) VALUES(:c) ON CONFLICT (code) DO NOTHING", {"c": c})
                 else:
                     conn.exec_driver_sql("INSERT OR IGNORE INTO peps(code) VALUES(:c)", {"c": c})
@@ -254,7 +251,7 @@ def add_peps_bulk(codes: List[str]) -> int:
 
 def set_logo(image_bytes: bytes):
     with engine.begin() as conn:
-        if is_pg():
+        if DB_KIND == "postgresql":
             conn.exec_driver_sql("INSERT INTO settings(key, blob) VALUES('logo', :b) ON CONFLICT (key) DO UPDATE SET blob=EXCLUDED.blob", {"b": image_bytes})
         else:
             conn.exec_driver_sql("INSERT OR REPLACE INTO settings(key, blob) VALUES('logo', :b)", {"b": image_bytes})
@@ -275,7 +272,6 @@ def upload_photos(files, rnc_num: str, tipo: str) -> List[dict]:
     if not supabase:
         st.warning("Supabase Storage não configurado — as fotos não serão enviadas para a nuvem.")
         return out
-    # cria bucket se não existir (ignora erro se já existir)
     try:
         supabase.storage.create_bucket(SUPABASE_BUCKET, public=True)
     except Exception:
@@ -316,7 +312,7 @@ def send_email(subject: str, body: str, attachments: List[tuple] = None):
 
 # ----------------- PDF -----------------
 def generate_pdf(irow: dict, fotos_ab: List[dict], fotos_enc: List[dict], fotos_rea: List[dict]) -> bytes:
-    import io as _io
+    import io as _io, requests
     buf = _io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     W, H = A4
@@ -383,7 +379,6 @@ def generate_pdf(irow: dict, fotos_ab: List[dict], fotos_enc: List[dict], fotos_
         x = 30; size = 140; pad = 8; col = 0
         for fo in lst:
             try:
-                import requests
                 if fo.get("url"):
                     r = requests.get(fo["url"], timeout=8)
                     img = ImageReader(_io.BytesIO(r.content))
@@ -422,7 +417,6 @@ def auth_box():
             st.info("Saiu do perfil Qualidade.")
 
     with st.sidebar.expander("🖼️ Logo da empresa (PDF)"):
-        # salvar logo na tabela settings.blob
         up = st.file_uploader("Enviar logo (PNG/JPG)", type=["png","jpg","jpeg"], key="uplogo")
         if up is not None:
             set_logo(up.getbuffer().tobytes())
@@ -438,12 +432,18 @@ menu = st.sidebar.radio("Menu", ["➕ Nova RNC", "🔎 Consultar/Editar", "🏷�
 if menu == "➕ Nova RNC":
     st.title("Nova RNC (RNC Nº automático)")
 
-    with st.form("form_rnc"):
+    # Gera o número ANTES de abrir o form (evita erro e alerta de submit)
+    try:
+        with engine.connect() as c:
+            rnc_preview = next_rnc_num(c)
+    except Exception as e:
+        rnc_preview = f"{datetime.now().year}-001"
+        st.warning("Não consegui prever o número da RNC agora. Vou exibir 001 como exemplo.")
+
+    with st.form("form_rnc", clear_on_submit=False):
         col0, col1, col2 = st.columns(3)
         emitente = col0.text_input("Emitente")
         data_insp = col1.date_input("Data", value=date.today())
-        with engine.begin() as conn:
-            rnc_preview = next_rnc_num(conn)
         col2.text_input("RNC Nº (automático)", value=rnc_preview, disabled=True)
 
         area = st.text_input("Área/Local", placeholder="Ex.: Correia TR-2011KS-07")
@@ -464,57 +464,48 @@ if menu == "➕ Nova RNC":
         submitted = st.form_submit_button("Salvar RNC")
 
     if submitted:
-        if st.session_state.get("is_quality") != True:
+        if not is_quality():
             st.error("Somente Qualidade pode salvar. Faça login na barra lateral.")
         else:
             with engine.begin() as conn:
-                # usar RETURNING id em PG
-                if is_pg():
-                    res = conn.execute(text("""
+                # gera o número real no momento do insert
+                real_num = next_rnc_num(conn)
+                if DB_KIND == "postgresql":
+                    new_id = conn.exec_driver_sql("""
                         INSERT INTO inspecoes
                         (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
                          processo_envolvido, origem, severidade, categoria, acoes, status)
                         VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
                         RETURNING id
-                    """), {
+                    """, {
                         "data": datetime.combine(data_insp, datetime.min.time()),
-                        "rnc": next_rnc_num(conn), "emit": emitente, "area": area, "pep": pep, "tit": titulo,
+                        "rnc": real_num, "emit": emitente, "area": area, "pep": pep, "tit": titulo,
                         "desc": descricao, "refs": referencias, "cau": causador, "proc": processo, "ori": origem,
                         "sev": severidade, "cat": categoria
-                    })
-                    new_id = res.scalar_one()
-                    # recupera rnc_num salvo
-                    rnc_row = conn.execute(text("SELECT rnc_num FROM inspecoes WHERE id=:i"), {"i": new_id}).fetchone()
-                    rnc_num = rnc_row[0]
+                    }).scalar_one()
                 else:
-                    rnc_num = next_rnc_num(conn)
-                    conn.execute(text("""
+                    conn.exec_driver_sql("""
                         INSERT INTO inspecoes
                         (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
                          processo_envolvido, origem, severidade, categoria, acoes, status)
                         VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
-                    """), {
+                    """, {
                         "data": datetime.combine(data_insp, datetime.min.time()),
-                        "rnc": rnc_num, "emit": emitente, "area": area, "pep": pep, "tit": titulo,
+                        "rnc": real_num, "emit": emitente, "area": area, "pep": pep, "tit": titulo,
                         "desc": descricao, "refs": referencias, "cau": causador, "proc": processo, "ori": origem,
                         "sev": severidade, "cat": categoria
                     })
-                    new_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
+                    new_id = conn.exec_driver_sql("SELECT last_insert_rowid()").scalar()
 
-            metas = upload_photos(fotos_ab or [], rnc_num, "abertura")
+            metas = upload_photos(fotos_ab or [], real_num, "abertura")
             with engine.begin() as conn:
                 for m in metas:
-                    conn.execute(text("""
+                    conn.exec_driver_sql("""
                         INSERT INTO fotos (inspecao_id, tipo, url, path, filename, mimetype)
                         VALUES (:i,:t,:u,:p,:n,:m)
-                    """), {"i": new_id, "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
+                    """, {"i": new_id, "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
 
-            st.success(f"RNC salva! Nº {rnc_num} (ID {new_id})")
-            with engine.begin() as conn:
-                row = conn.execute(text("SELECT * FROM inspecoes WHERE id=:i"), {"i": new_id}).mappings().first()
-                fotosA = conn.execute(text("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='abertura'"), {"i": new_id}).mappings().all()
-            pdf = generate_pdf(dict(row), [dict(x) for x in fotosA], [], [])
-            st.download_button("⬇️ Baixar PDF", data=pdf, file_name=f"RNC_{row['rnc_num']}.pdf", mime="application/pdf")
+            st.success(f"RNC salva! Nº {real_num} (ID {new_id})")
 
 # ----------------- Consultar/Editar -----------------
 elif menu == "🔎 Consultar/Editar":
@@ -526,10 +517,10 @@ elif menu == "🔎 Consultar/Editar":
     else:
         sel = st.number_input("Ver RNC (ID)", min_value=int(df["id"].min()), max_value=int(df["id"].max()), value=int(df["id"].iloc[0]), step=1)
         with engine.begin() as conn:
-            row = conn.execute(text("SELECT * FROM inspecoes WHERE id=:i"), {"i": int(sel)}).mappings().first()
-            fotosA = conn.execute(text("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='abertura'"), {"i": int(sel)}).mappings().all()
-            fotosE = conn.execute(text("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='encerramento'"), {"i": int(sel)}).mappings().all()
-            fotosR = conn.execute(text("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='reabertura'"), {"i": int(sel)}).mappings().all()
+            row = conn.exec_driver_sql("SELECT * FROM inspecoes WHERE id=:i", {"i": int(sel)}).mappings().first()
+            fotosA = conn.exec_driver_sql("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='abertura'", {"i": int(sel)}).mappings().all()
+            fotosE = conn.exec_driver_sql("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='encerramento'", {"i": int(sel)}).mappings().all()
+            fotosR = conn.exec_driver_sql("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='reabertura'", {"i": int(sel)}).mappings().all()
 
         if not row:
             st.error("ID não encontrado.")
@@ -551,7 +542,7 @@ elif menu == "🔎 Consultar/Editar":
                     st.image(fo["url"] or fo["path"], use_column_width=True, caption="Reabertura")
 
             st.markdown("---")
-            if st.session_state.get("is_quality") == True:
+            if is_quality():
                 with st.expander("✅ Encerrar RNC"):
                     encerr_por = st.text_input("Encerrada por", key=f"encpor_{row['id']}")
                     encerr_obs = st.text_area("Observações", key=f"encobs_{row['id']}")
@@ -561,15 +552,15 @@ elif menu == "🔎 Consultar/Editar":
                     if st.button("Encerrar agora", key=f"encok_{row['id']}"):
                         metas = upload_photos(fotos_enc or [], row["rnc_num"], "encerramento")
                         with engine.begin() as conn:
-                            conn.execute(text("""
+                            conn.exec_driver_sql("""
                                 UPDATE inspecoes SET status='Encerrada', encerrada_em=:dt, encerrada_por=:por,
                                     encerramento_obs=:obs, encerramento_desc=:desc, eficacia=:ef WHERE id=:i
-                            """), {"dt": datetime.now(), "por": encerr_por, "obs": encerr_obs, "desc": encerr_desc, "ef": eficacia, "i": int(sel)})
+                            """, {"dt": datetime.now(), "por": encerr_por, "obs": encerr_obs, "desc": encerr_desc, "ef": eficacia, "i": int(sel)})
                             for m in metas:
-                                conn.execute(text("""
+                                conn.exec_driver_sql("""
                                     INSERT INTO fotos (inspecao_id, tipo, url, path, filename, mimetype)
                                     VALUES (:i,:t,:u,:p,:n,:m)
-                                """), {"i": int(sel), "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
+                                """, {"i": int(sel), "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
                         st.success("RNC encerrada.")
 
                 with st.expander("♻️ Reabrir RNC"):
@@ -580,15 +571,15 @@ elif menu == "🔎 Consultar/Editar":
                     if st.button("Reabrir agora", key=f"reok_{row['id']}"):
                         metas = upload_photos(fotos_rea or [], row["rnc_num"], "reabertura")
                         with engine.begin() as conn:
-                            conn.execute(text("""
+                            conn.exec_driver_sql("""
                                 UPDATE inspecoes SET status='Em ação', reaberta_em=:dt, reaberta_por=:por,
                                     reabertura_motivo=:mot, reabertura_desc=:desc WHERE id=:i
-                            """), {"dt": datetime.now(), "por": reab_por, "mot": reab_motivo, "desc": reab_desc, "i": int(sel)})
+                            """, {"dt": datetime.now(), "por": reab_por, "mot": reab_motivo, "desc": reab_desc, "i": int(sel)})
                             for m in metas:
-                                conn.execute(text("""
+                                conn.exec_driver_sql("""
                                     INSERT INTO fotos (inspecao_id, tipo, url, path, filename, mimetype)
                                     VALUES (:i,:t,:u,:p,:n,:m)
-                                """), {"i": int(sel), "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
+                                """, {"i": int(sel), "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
                         st.success("RNC reaberta.")
 
                 with st.expander("🚫 Cancelar RNC"):
@@ -596,9 +587,9 @@ elif menu == "🔎 Consultar/Editar":
                     c_mot = st.text_area("Motivo", key=f"canmot_{row['id']}")
                     if st.button("Cancelar", key=f"canok_{row['id']}"):
                         with engine.begin() as conn:
-                            conn.execute(text("""
+                            conn.exec_driver_sql("""
                                 UPDATE inspecoes SET status='Cancelada', cancelada_em=:dt, cancelada_por=:por, cancelamento_motivo=:mot WHERE id=:i
-                            """), {"dt": datetime.now(), "por": c_por, "mot": c_mot, "i": int(sel)})
+                            """, {"dt": datetime.now(), "por": c_por, "mot": c_mot, "i": int(sel)})
                         st.success("RNC cancelada.")
 
                 with st.expander("🗑️ Excluir permanentemente"):
@@ -606,8 +597,8 @@ elif menu == "🔎 Consultar/Editar":
                     if st.button("Excluir RNC", key=f"delok_{row['id']}"):
                         if conf.strip().upper() == "CONFIRMAR":
                             with engine.begin() as conn:
-                                conn.execute(text("DELETE FROM fotos WHERE inspecao_id=:i"), {"i": int(sel)})
-                                conn.execute(text("DELETE FROM inspecoes WHERE id=:i"), {"i": int(sel)})
+                                conn.exec_driver_sql("DELETE FROM fotos WHERE inspecao_id=:i", {"i": int(sel)})
+                                conn.exec_driver_sql("DELETE FROM inspecoes WHERE id=:i", {"i": int(sel)})
                             st.success("RNC excluída.")
                         else:
                             st.warning("Digite CONFIRMAR exatamente.")
@@ -651,5 +642,5 @@ elif menu == "⬇️⬆️ CSV":
                     if k not in params:
                         params[k] = None
                 placeholders = ", ".join([f":{k}" for k in cols_db])
-                conn.execute(text(f"INSERT INTO inspecoes ({', '.join(cols_db)}) VALUES ({placeholders})"), params)
+                conn.exec_driver_sql(f"INSERT INTO inspecoes ({', '.join(cols_db)}) VALUES ({placeholders})", params)
         st.success("Importação concluída.")
