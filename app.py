@@ -1,11 +1,10 @@
 
-import os, io, uuid, tempfile, traceback
+import os, io, uuid, traceback
 from datetime import datetime, date
 from typing import List, Optional
 
 import streamlit as st
 import pandas as pd
-from PIL import Image
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
@@ -25,12 +24,12 @@ from reportlab.lib.utils import ImageReader
 import smtplib
 from email.message import EmailMessage
 
-st.set_page_config(page_title="RNC v08 — Completo", page_icon="📝", layout="wide")
+st.set_page_config(page_title="RNC v08 — Completo (PG fix)", page_icon="📝", layout="wide")
 
 # ----------------- Secrets / Env -----------------
 SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "")
-SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")  # pooler
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "RNC-FOTOS")
 
 QUALITY_PASS = os.getenv("QUALITY_PASS", "qualidade123")
@@ -73,67 +72,130 @@ def get_supabase():
 engine = get_engine()
 supabase = get_supabase()
 
+def is_pg() -> bool:
+    return engine.url.get_backend_name().startswith("postgres")
+
 # ----------------- Migrações -----------------
 def init_db():
     with engine.begin() as conn:
-        conn.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS inspecoes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data TIMESTAMP NULL,
-            rnc_num TEXT,
-            emitente TEXT,
-            area TEXT,
-            pep TEXT,
-            titulo TEXT,
-            responsavel TEXT,
-            descricao TEXT,
-            referencias TEXT,
-            causador TEXT,
-            processo_envolvido TEXT,
-            origem TEXT,
-            severidade TEXT,
-            categoria TEXT,
-            acoes TEXT,
-            status TEXT DEFAULT 'Aberta',
-            encerrada_em TIMESTAMP NULL,
-            encerrada_por TEXT,
-            encerramento_obs TEXT,
-            encerramento_desc TEXT,
-            eficacia TEXT,
-            responsavel_acao TEXT,
-            reaberta_em TIMESTAMP NULL,
-            reaberta_por TEXT,
-            reabertura_motivo TEXT,
-            reabertura_desc TEXT,
-            cancelada_em TIMESTAMP NULL,
-            cancelada_por TEXT,
-            cancelamento_motivo TEXT
-        );
-        """)
-        conn.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS fotos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            inspecao_id INTEGER NOT NULL,
-            tipo TEXT,
-            url TEXT,
-            path TEXT,
-            filename TEXT,
-            mimetype TEXT
-        );
-        """)
-        conn.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS peps (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE
-        );
-        """)
-        conn.exec_driver_sql("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            blob BLOB,
-            text TEXT
-        );
-        """)
+        if is_pg():
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS inspecoes (
+                id BIGSERIAL PRIMARY KEY,
+                data TIMESTAMP NULL,
+                rnc_num TEXT,
+                emitente TEXT,
+                area TEXT,
+                pep TEXT,
+                titulo TEXT,
+                responsavel TEXT,
+                descricao TEXT,
+                referencias TEXT,
+                causador TEXT,
+                processo_envolvido TEXT,
+                origem TEXT,
+                severidade TEXT,
+                categoria TEXT,
+                acoes TEXT,
+                status TEXT DEFAULT 'Aberta',
+                encerrada_em TIMESTAMP NULL,
+                encerrada_por TEXT,
+                encerramento_obs TEXT,
+                encerramento_desc TEXT,
+                eficacia TEXT,
+                responsavel_acao TEXT,
+                reaberta_em TIMESTAMP NULL,
+                reaberta_por TEXT,
+                reabertura_motivo TEXT,
+                reabertura_desc TEXT,
+                cancelada_em TIMESTAMP NULL,
+                cancelada_por TEXT,
+                cancelamento_motivo TEXT
+            );
+            """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS fotos (
+                id BIGSERIAL PRIMARY KEY,
+                inspecao_id BIGINT NOT NULL,
+                tipo TEXT,
+                url TEXT,
+                path TEXT,
+                filename TEXT,
+                mimetype TEXT
+            );
+            """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS peps (
+                id BIGSERIAL PRIMARY KEY,
+                code TEXT UNIQUE
+            );
+            """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                blob BYTEA,
+                text TEXT
+            );
+            """)
+        else:
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS inspecoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data TIMESTAMP NULL,
+                rnc_num TEXT,
+                emitente TEXT,
+                area TEXT,
+                pep TEXT,
+                titulo TEXT,
+                responsavel TEXT,
+                descricao TEXT,
+                referencias TEXT,
+                causador TEXT,
+                processo_envolvido TEXT,
+                origem TEXT,
+                severidade TEXT,
+                categoria TEXT,
+                acoes TEXT,
+                status TEXT DEFAULT 'Aberta',
+                encerrada_em TIMESTAMP NULL,
+                encerrada_por TEXT,
+                encerramento_obs TEXT,
+                encerramento_desc TEXT,
+                eficacia TEXT,
+                responsavel_acao TEXT,
+                reaberta_em TIMESTAMP NULL,
+                reaberta_por TEXT,
+                reabertura_motivo TEXT,
+                reabertura_desc TEXT,
+                cancelada_em TIMESTAMP NULL,
+                cancelada_por TEXT,
+                cancelamento_motivo TEXT
+            );
+            """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS fotos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                inspecao_id INTEGER NOT NULL,
+                tipo TEXT,
+                url TEXT,
+                path TEXT,
+                filename TEXT,
+                mimetype TEXT
+            );
+            """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS peps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE
+            );
+            """)
+            conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                blob BLOB,
+                text TEXT
+            );
+            """)
 
 init_db()
 
@@ -181,7 +243,10 @@ def add_peps_bulk(codes: List[str]) -> int:
             c = c.strip()
             if not c: continue
             try:
-                conn.exec_driver_sql("INSERT OR IGNORE INTO peps(code) VALUES(:c)", {"c": c})
+                if is_pg():
+                    conn.exec_driver_sql("INSERT INTO peps(code) VALUES(:c) ON CONFLICT (code) DO NOTHING", {"c": c})
+                else:
+                    conn.exec_driver_sql("INSERT OR IGNORE INTO peps(code) VALUES(:c)", {"c": c})
                 ok += 1
             except Exception:
                 pass
@@ -189,12 +254,15 @@ def add_peps_bulk(codes: List[str]) -> int:
 
 def set_logo(image_bytes: bytes):
     with engine.begin() as conn:
-        conn.exec_driver_sql("INSERT OR REPLACE INTO settings(key, blob) VALUES('logo', :b)", {"b": image_bytes})
+        if is_pg():
+            conn.exec_driver_sql("INSERT INTO settings(key, blob) VALUES('logo', :b) ON CONFLICT (key) DO UPDATE SET blob=EXCLUDED.blob", {"b": image_bytes})
+        else:
+            conn.exec_driver_sql("INSERT OR REPLACE INTO settings(key, blob) VALUES('logo', :b)", {"b": image_bytes})
 
 def get_logo() -> Optional[bytes]:
     with engine.begin() as conn:
         r = conn.exec_driver_sql("SELECT blob FROM settings WHERE key='logo'").fetchone()
-    return r[0] if r else None
+    return bytes(r[0]) if (r and r[0] is not None) else None
 
 def clear_logo():
     with engine.begin() as conn:
@@ -207,6 +275,7 @@ def upload_photos(files, rnc_num: str, tipo: str) -> List[dict]:
     if not supabase:
         st.warning("Supabase Storage não configurado — as fotos não serão enviadas para a nuvem.")
         return out
+    # cria bucket se não existir (ignora erro se já existir)
     try:
         supabase.storage.create_bucket(SUPABASE_BUCKET, public=True)
     except Exception:
@@ -215,8 +284,7 @@ def upload_photos(files, rnc_num: str, tipo: str) -> List[dict]:
         try:
             ext = os.path.splitext(f.name)[1].lower() or ".jpg"
             key = f"{rnc_num}/{tipo}/{uuid.uuid4().hex}{ext}"
-            data = f.read()
-            f.seek(0)
+            data = f.read(); f.seek(0)
             supabase.storage.from_(SUPABASE_BUCKET).upload(key, data, {"content-type": f.type})
             url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(key)
             out.append({"url": url, "path": key, "filename": f.name, "mimetype": f.type or "image/jpeg", "tipo": tipo})
@@ -248,7 +316,8 @@ def send_email(subject: str, body: str, attachments: List[tuple] = None):
 
 # ----------------- PDF -----------------
 def generate_pdf(irow: dict, fotos_ab: List[dict], fotos_enc: List[dict], fotos_rea: List[dict]) -> bytes:
-    buf = io.BytesIO()
+    import io as _io
+    buf = _io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     W, H = A4
 
@@ -256,7 +325,7 @@ def generate_pdf(irow: dict, fotos_ab: List[dict], fotos_enc: List[dict], fotos_
     logo = get_logo()
     if logo:
         try:
-            c.drawImage(ImageReader(io.BytesIO(logo)), 30, y-25, width=120, height=25, preserveAspectRatio=True, mask='auto')
+            c.drawImage(ImageReader(_io.BytesIO(logo)), 30, y-25, width=120, height=25, preserveAspectRatio=True, mask='auto')
         except Exception:
             pass
     c.setFont("Helvetica-Bold", 14)
@@ -279,11 +348,11 @@ def generate_pdf(irow: dict, fotos_ab: List[dict], fotos_enc: List[dict], fotos_
          f"{irow.get('causador','')} / {irow.get('processo_envolvido','')} / {irow.get('origem','')}")
     line("Responsável", irow.get("responsavel"))
 
-    def block(title, text):
+    def block(title, textv):
         nonlocal y
         c.setFont("Helvetica-Bold", 11); c.drawString(30, y, title); y -= 12
         c.setFont("Helvetica", 10)
-        for ln in str(text or "").splitlines():
+        for ln in str(textv or "").splitlines():
             c.drawString(30, y, ln[:110]); y -= 12
             if y < 80: c.showPage(); y = H - 30
         y -= 6
@@ -317,7 +386,7 @@ def generate_pdf(irow: dict, fotos_ab: List[dict], fotos_enc: List[dict], fotos_
                 import requests
                 if fo.get("url"):
                     r = requests.get(fo["url"], timeout=8)
-                    img = ImageReader(io.BytesIO(r.content))
+                    img = ImageReader(_io.BytesIO(r.content))
                 else:
                     img = ImageReader(fo.get("path"))
                 if y - size < 60:
@@ -339,24 +408,36 @@ def generate_pdf(irow: dict, fotos_ab: List[dict], fotos_enc: List[dict], fotos_
 
 # ----------------- UI / Sidebar -----------------
 def auth_box():
-    require_quality()
+    with st.sidebar.expander("🔐 Acesso Qualidade"):
+        pwd = st.text_input("Senha", type="password", key="pwd_q")
+        c1, c2 = st.columns(2)
+        if c1.button("Entrar"):
+            if pwd == QUALITY_PASS:
+                st.session_state.is_quality = True
+                st.success("Perfil Qualidade ativo.")
+            else:
+                st.error("Senha incorreta.")
+        if c2.button("Sair"):
+            st.session_state.is_quality = False
+            st.info("Saiu do perfil Qualidade.")
+
     with st.sidebar.expander("🖼️ Logo da empresa (PDF)"):
-        current = get_logo()
-        if current:
-            st.image(Image.open(io.BytesIO(current)), width=180)
-            if st.button("Remover logo"):
-                clear_logo(); st.warning("Logo removida. Recarregue.")
+        # salvar logo na tabela settings.blob
         up = st.file_uploader("Enviar logo (PNG/JPG)", type=["png","jpg","jpeg"], key="uplogo")
         if up is not None:
             set_logo(up.getbuffer().tobytes())
             st.success("Logo atualizada.")
+        if st.button("Remover logo"):
+            clear_logo(); st.warning("Logo removida.")
 
 auth_box()
+
 menu = st.sidebar.radio("Menu", ["➕ Nova RNC", "🔎 Consultar/Editar", "🏷️ PEPs", "⬇️⬆️ CSV"])
 
 # ----------------- Nova RNC -----------------
 if menu == "➕ Nova RNC":
     st.title("Nova RNC (RNC Nº automático)")
+
     with st.form("form_rnc"):
         col0, col1, col2 = st.columns(3)
         emitente = col0.text_input("Emitente")
@@ -383,54 +464,72 @@ if menu == "➕ Nova RNC":
         submitted = st.form_submit_button("Salvar RNC")
 
     if submitted:
-        if not is_quality():
+        if st.session_state.get("is_quality") != True:
             st.error("Somente Qualidade pode salvar. Faça login na barra lateral.")
         else:
             with engine.begin() as conn:
-                rnc_num = next_rnc_num(conn)
-                conn.exec_driver_sql("""
-                    INSERT INTO inspecoes
-                    (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
-                    processo_envolvido, origem, severidade, categoria, acoes, status)
-                    VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
-                """, {
-                    "data": datetime.combine(data_insp, datetime.min.time()),
-                    "rnc": rnc_num, "emit": emitente, "area": area, "pep": pep, "tit": titulo,
-                    "desc": descricao, "refs": referencias, "cau": causador, "proc": processo, "ori": origem,
-                    "sev": severidade, "cat": categoria
-                })
-                new_id = conn.exec_driver_sql("SELECT last_insert_rowid()").fetchone()[0]
+                # usar RETURNING id em PG
+                if is_pg():
+                    res = conn.execute(text("""
+                        INSERT INTO inspecoes
+                        (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
+                         processo_envolvido, origem, severidade, categoria, acoes, status)
+                        VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
+                        RETURNING id
+                    """), {
+                        "data": datetime.combine(data_insp, datetime.min.time()),
+                        "rnc": next_rnc_num(conn), "emit": emitente, "area": area, "pep": pep, "tit": titulo,
+                        "desc": descricao, "refs": referencias, "cau": causador, "proc": processo, "ori": origem,
+                        "sev": severidade, "cat": categoria
+                    })
+                    new_id = res.scalar_one()
+                    # recupera rnc_num salvo
+                    rnc_row = conn.execute(text("SELECT rnc_num FROM inspecoes WHERE id=:i"), {"i": new_id}).fetchone()
+                    rnc_num = rnc_row[0]
+                else:
+                    rnc_num = next_rnc_num(conn)
+                    conn.execute(text("""
+                        INSERT INTO inspecoes
+                        (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
+                         processo_envolvido, origem, severidade, categoria, acoes, status)
+                        VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
+                    """), {
+                        "data": datetime.combine(data_insp, datetime.min.time()),
+                        "rnc": rnc_num, "emit": emitente, "area": area, "pep": pep, "tit": titulo,
+                        "desc": descricao, "refs": referencias, "cau": causador, "proc": processo, "ori": origem,
+                        "sev": severidade, "cat": categoria
+                    })
+                    new_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
 
             metas = upload_photos(fotos_ab or [], rnc_num, "abertura")
             with engine.begin() as conn:
                 for m in metas:
-                    conn.exec_driver_sql("""
+                    conn.execute(text("""
                         INSERT INTO fotos (inspecao_id, tipo, url, path, filename, mimetype)
                         VALUES (:i,:t,:u,:p,:n,:m)
-                    """, {"i": new_id, "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
+                    """), {"i": new_id, "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
 
             st.success(f"RNC salva! Nº {rnc_num} (ID {new_id})")
             with engine.begin() as conn:
-                row = conn.exec_driver_sql("SELECT * FROM inspecoes WHERE id=:i", {"i": new_id}).mappings().first()
-                fotosA = conn.exec_driver_sql("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='abertura'", {"i": new_id}).mappings().all()
+                row = conn.execute(text("SELECT * FROM inspecoes WHERE id=:i"), {"i": new_id}).mappings().first()
+                fotosA = conn.execute(text("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='abertura'"), {"i": new_id}).mappings().all()
             pdf = generate_pdf(dict(row), [dict(x) for x in fotosA], [], [])
             st.download_button("⬇️ Baixar PDF", data=pdf, file_name=f"RNC_{row['rnc_num']}.pdf", mime="application/pdf")
-            send_email(f"[RNC] Aberta {row['rnc_num']}", f"RNC {row['rnc_num']} aberta por {row['emitente']} — {row['titulo']}")
 
 # ----------------- Consultar/Editar -----------------
 elif menu == "🔎 Consultar/Editar":
     st.title("Consultar / Editar RNCs")
     df = pd.read_sql("SELECT id, data, rnc_num, titulo, emitente, area, pep, categoria, severidade, status FROM inspecoes ORDER BY id DESC", engine)
-    st.dataframe(df, use_container_width=True, height=300)
+    st.dataframe(df, use_container_width=True, height=320)
     if df.empty:
         st.info("Sem registros.")
     else:
         sel = st.number_input("Ver RNC (ID)", min_value=int(df["id"].min()), max_value=int(df["id"].max()), value=int(df["id"].iloc[0]), step=1)
         with engine.begin() as conn:
-            row = conn.exec_driver_sql("SELECT * FROM inspecoes WHERE id=:i", {"i": int(sel)}).mappings().first()
-            fotosA = conn.exec_driver_sql("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='abertura'", {"i": int(sel)}).mappings().all()
-            fotosE = conn.exec_driver_sql("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='encerramento'", {"i": int(sel)}).mappings().all()
-            fotosR = conn.exec_driver_sql("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='reabertura'", {"i": int(sel)}).mappings().all()
+            row = conn.execute(text("SELECT * FROM inspecoes WHERE id=:i"), {"i": int(sel)}).mappings().first()
+            fotosA = conn.execute(text("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='abertura'"), {"i": int(sel)}).mappings().all()
+            fotosE = conn.execute(text("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='encerramento'"), {"i": int(sel)}).mappings().all()
+            fotosR = conn.execute(text("SELECT * FROM fotos WHERE inspecao_id=:i AND tipo='reabertura'"), {"i": int(sel)}).mappings().all()
 
         if not row:
             st.error("ID não encontrado.")
@@ -452,12 +551,7 @@ elif menu == "🔎 Consultar/Editar":
                     st.image(fo["url"] or fo["path"], use_column_width=True, caption="Reabertura")
 
             st.markdown("---")
-            c1, c2, c3, c4, c5 = st.columns(5)
-            if c1.button("📄 PDF"):
-                pdf = generate_pdf(dict(row), [dict(x) for x in fotosA], [dict(x) for x in fotosE], [dict(x) for x in fotosR])
-                st.download_button("Baixar PDF", data=pdf, file_name=f"RNC_{row['rnc_num']}.pdf", mime="application/pdf", key=f"pdf_{row['id']}")
-
-            if is_quality():
+            if st.session_state.get("is_quality") == True:
                 with st.expander("✅ Encerrar RNC"):
                     encerr_por = st.text_input("Encerrada por", key=f"encpor_{row['id']}")
                     encerr_obs = st.text_area("Observações", key=f"encobs_{row['id']}")
@@ -467,15 +561,15 @@ elif menu == "🔎 Consultar/Editar":
                     if st.button("Encerrar agora", key=f"encok_{row['id']}"):
                         metas = upload_photos(fotos_enc or [], row["rnc_num"], "encerramento")
                         with engine.begin() as conn:
-                            conn.exec_driver_sql("""
+                            conn.execute(text("""
                                 UPDATE inspecoes SET status='Encerrada', encerrada_em=:dt, encerrada_por=:por,
                                     encerramento_obs=:obs, encerramento_desc=:desc, eficacia=:ef WHERE id=:i
-                            """, {"dt": datetime.now(), "por": encerr_por, "obs": encerr_obs, "desc": encerr_desc, "ef": eficacia, "i": int(sel)})
+                            """), {"dt": datetime.now(), "por": encerr_por, "obs": encerr_obs, "desc": encerr_desc, "ef": eficacia, "i": int(sel)})
                             for m in metas:
-                                conn.exec_driver_sql("""
+                                conn.execute(text("""
                                     INSERT INTO fotos (inspecao_id, tipo, url, path, filename, mimetype)
                                     VALUES (:i,:t,:u,:p,:n,:m)
-                                """, {"i": int(sel), "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
+                                """), {"i": int(sel), "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
                         st.success("RNC encerrada.")
 
                 with st.expander("♻️ Reabrir RNC"):
@@ -486,15 +580,15 @@ elif menu == "🔎 Consultar/Editar":
                     if st.button("Reabrir agora", key=f"reok_{row['id']}"):
                         metas = upload_photos(fotos_rea or [], row["rnc_num"], "reabertura")
                         with engine.begin() as conn:
-                            conn.exec_driver_sql("""
+                            conn.execute(text("""
                                 UPDATE inspecoes SET status='Em ação', reaberta_em=:dt, reaberta_por=:por,
                                     reabertura_motivo=:mot, reabertura_desc=:desc WHERE id=:i
-                            """, {"dt": datetime.now(), "por": reab_por, "mot": reab_motivo, "desc": reab_desc, "i": int(sel)})
+                            """), {"dt": datetime.now(), "por": reab_por, "mot": reab_motivo, "desc": reab_desc, "i": int(sel)})
                             for m in metas:
-                                conn.exec_driver_sql("""
+                                conn.execute(text("""
                                     INSERT INTO fotos (inspecao_id, tipo, url, path, filename, mimetype)
                                     VALUES (:i,:t,:u,:p,:n,:m)
-                                """, {"i": int(sel), "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
+                                """), {"i": int(sel), "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
                         st.success("RNC reaberta.")
 
                 with st.expander("🚫 Cancelar RNC"):
@@ -502,9 +596,9 @@ elif menu == "🔎 Consultar/Editar":
                     c_mot = st.text_area("Motivo", key=f"canmot_{row['id']}")
                     if st.button("Cancelar", key=f"canok_{row['id']}"):
                         with engine.begin() as conn:
-                            conn.exec_driver_sql("""
+                            conn.execute(text("""
                                 UPDATE inspecoes SET status='Cancelada', cancelada_em=:dt, cancelada_por=:por, cancelamento_motivo=:mot WHERE id=:i
-                            """, {"dt": datetime.now(), "por": c_por, "mot": c_mot, "i": int(sel)})
+                            """), {"dt": datetime.now(), "por": c_por, "mot": c_mot, "i": int(sel)})
                         st.success("RNC cancelada.")
 
                 with st.expander("🗑️ Excluir permanentemente"):
@@ -512,11 +606,13 @@ elif menu == "🔎 Consultar/Editar":
                     if st.button("Excluir RNC", key=f"delok_{row['id']}"):
                         if conf.strip().upper() == "CONFIRMAR":
                             with engine.begin() as conn:
-                                conn.exec_driver_sql("DELETE FROM fotos WHERE inspecao_id=:i", {"i": int(sel)})
-                                conn.exec_driver_sql("DELETE FROM inspecoes WHERE id=:i", {"i": int(sel)})
+                                conn.execute(text("DELETE FROM fotos WHERE inspecao_id=:i"), {"i": int(sel)})
+                                conn.execute(text("DELETE FROM inspecoes WHERE id=:i"), {"i": int(sel)})
                             st.success("RNC excluída.")
                         else:
                             st.warning("Digite CONFIRMAR exatamente.")
+            else:
+                st.info("Entre como Qualidade para encerrar/reabrir/cancelar/excluir.")
 
 # ----------------- PEPs -----------------
 elif menu == "🏷️ PEPs":
@@ -551,10 +647,9 @@ elif menu == "⬇️⬆️ CSV":
         with engine.begin() as conn:
             for _, r in imp.fillna("").iterrows():
                 params = {k: r.get(k) for k in cols_db if k in imp.columns}
-                # completa colunas faltantes
                 for k in cols_db:
                     if k not in params:
                         params[k] = None
                 placeholders = ", ".join([f":{k}" for k in cols_db])
-                conn.exec_driver_sql(f"INSERT INTO inspecoes ({', '.join(cols_db)}) VALUES ({placeholders})", params)
+                conn.execute(text(f"INSERT INTO inspecoes ({', '.join(cols_db)}) VALUES ({placeholders})"), params)
         st.success("Importação concluída.")
