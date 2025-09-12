@@ -1,5 +1,5 @@
 
-import os, io, uuid, traceback, csv
+import os, io, uuid, traceback, csv, time
 from datetime import datetime, date
 from typing import List, Optional
 
@@ -20,11 +20,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-# Email (opcional)
-import smtplib
-from email.message import EmailMessage
-
-st.set_page_config(page_title="RNC v08 — Completo (PG fix v3)", page_icon="📝", layout="wide")
+st.set_page_config(page_title="RNC v08 — Completo (v4 antifalha)", page_icon="📝", layout="wide")
 
 # ----------------- Secrets / Env -----------------
 SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
@@ -32,14 +28,6 @@ SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "")
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "RNC-FOTOS")
 QUALITY_PASS = os.getenv("QUALITY_PASS", "qualidade123")
-
-# Email (opcional)
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-EMAIL_FROM = os.getenv("EMAIL_FROM", "")
-EMAIL_TO = [e.strip() for e in os.getenv("EMAIL_TO", "").split(",") if e.strip()]
 
 # ----------------- Conexões -----------------
 def get_engine():
@@ -134,7 +122,6 @@ def init_db():
                 text TEXT
             );
             """)
-            # índice único opcional em rnc_num
             conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uidx_inspecoes_rnc ON inspecoes (rnc_num);")
         else:
             conn.exec_driver_sql("""
@@ -203,8 +190,8 @@ init_db()
 def is_quality() -> bool:
     return st.session_state.get("is_quality", False)
 
-def require_quality():
-    with st.sidebar.expander("🔐 Entrar (Qualidade)"):
+def auth_box():
+    with st.sidebar.expander("🔐 Acesso Qualidade"):
         pwd = st.text_input("Senha", type="password", key="pwd_q")
         c1, c2 = st.columns(2)
         if c1.button("Entrar"):
@@ -217,30 +204,30 @@ def require_quality():
             st.session_state.is_quality = False
             st.info("Saiu do perfil Qualidade.")
 
+    with st.sidebar.expander("🖼️ Logo da empresa (PDF)"):
+        up = st.file_uploader("Enviar logo (PNG/JPG)", type=["png","jpg","jpeg"], key="uplogo")
+        if up is not None:
+            set_logo(up.getbuffer().tobytes())
+            st.success("Logo atualizada.")
+        if st.button("Remover logo"):
+            clear_logo(); st.warning("Logo removida.")
+
 def next_rnc_num_sql(conn) -> str:
     y = datetime.now().year
     if DB_KIND == "postgresql":
-        # usa split_part para pegar o sufixo numérico
         q = text("""
             SELECT COALESCE(MAX(CAST(SPLIT_PART(rnc_num, '-', 2) AS INTEGER)), 0)
             FROM inspecoes
             WHERE rnc_num LIKE :p
         """)
-        mx = conn.execute(q, {"p": f"{y}-%"}).scalar() or 0
     else:
-        # sqlite: substr após '-'
         q = text("""
             SELECT COALESCE(MAX(CAST(substr(rnc_num, instr(rnc_num, '-')+1) AS INTEGER)), 0)
             FROM inspecoes
             WHERE rnc_num LIKE :p
         """)
-        mx = conn.execute(q, {"p": f"{y}-%"}).scalar() or 0
+    mx = conn.execute(q, {"p": f"{y}-%"}).scalar() or 0
     return f"{y}-{int(mx)+1:03d}"
-
-def list_peps() -> List[str]:
-    with engine.begin() as conn:
-        rows = conn.exec_driver_sql("SELECT code FROM peps ORDER BY code").fetchall()
-    return [r[0] for r in rows]
 
 def add_peps_bulk(codes: List[str]) -> int:
     ok = 0
@@ -297,152 +284,50 @@ def upload_photos(files, rnc_num: str, tipo: str) -> List[dict]:
             st.error(f"Falha ao subir {f.name}: {e}")
     return out
 
-def send_email(subject: str, body: str, attachments: List[tuple] = None):
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and EMAIL_FROM and EMAIL_TO):
-        st.info("✉️ E-mail não enviado: SMTP incompleto nos Secrets.")
-        return
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = EMAIL_FROM
-        msg["To"] = ", ".join(EMAIL_TO)
-        msg.set_content(body)
-        for att in attachments or []:
-            fname, data, mime = att
-            maintype, subtype = (mime.split("/", 1) + ["octet-stream"])[:2]
-            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=fname)
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-        st.success("✉️ E-mail enviado.")
-    except Exception as e:
-        st.warning(f"E-mail não enviado: {e}")
-
-# ----------------- PDF -----------------
-def generate_pdf(irow: dict, fotos_ab: List[dict], fotos_enc: List[dict], fotos_rea: List[dict]) -> bytes:
-    import io as _io, requests
-    buf = _io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-
-    y = H - 30
-    logo = get_logo()
-    if logo:
+# Inserção antifalha de RNC (tenta números até gravar)
+def insert_rnc_antifalha(conn, payload: dict) -> int:
+    tentativas = 20
+    for i in range(tentativas):
+        num = next_rnc_num_sql(conn)
+        payload2 = dict(payload)
+        payload2["rnc"] = num
         try:
-            c.drawImage(ImageReader(_io.BytesIO(logo)), 30, y-25, width=120, height=25, preserveAspectRatio=True, mask='auto')
+            if DB_KIND == "postgresql":
+                # ON CONFLICT evita quebrar, retornando nada caso duplique
+                rid = conn.exec_driver_sql("""
+                    INSERT INTO inspecoes
+                    (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
+                     processo_envolvido, origem, severidade, categoria, acoes, status)
+                    VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
+                    ON CONFLICT (rnc_num) DO NOTHING
+                    RETURNING id
+                """, payload2).scalar()
+                if rid is not None:
+                    return rid
+            else:
+                conn.exec_driver_sql("""
+                    INSERT OR IGNORE INTO inspecoes
+                    (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
+                     processo_envolvido, origem, severidade, categoria, acoes, status)
+                    VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
+                """, payload2)
+                rid = conn.exec_driver_sql("SELECT last_insert_rowid()").scalar()
+                if rid and int(rid) > 0:
+                    return int(rid)
         except Exception:
             pass
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(170, y-10, "RNC - RELATÓRIO DE NÃO CONFORMIDADE")
-    y -= 40
+        # se não conseguiu, espera um pouco e tenta outro número
+        time.sleep(0.05)
+    raise RuntimeError("Não foi possível gerar um número de RNC único após várias tentativas.")
 
-    def line(label, val):
-        nonlocal y
-        c.setFont("Helvetica-Bold", 10); c.drawString(30, y, f"{label}: ")
-        c.setFont("Helvetica", 10); c.drawString(160, y, str(val or "")); y -= 14
-
-    line("RNC Nº", irow.get("rnc_num"))
-    line("Data", str(irow.get("data") or "")[:10])
-    line("Emitente", irow.get("emitente"))
-    line("Área/Local", irow.get("area"))
-    line("PEP", irow.get("pep"))
-    line("Categoria", irow.get("categoria"))
-    line("Severidade", irow.get("severidade"))
-    line("Causador / Processo / Origem",
-         f"{irow.get('causador','')} / {irow.get('processo_envolvido','')} / {irow.get('origem','')}")
-    line("Responsável", irow.get("responsavel"))
-
-    def block(title, textv):
-        nonlocal y
-        c.setFont("Helvetica-Bold", 11); c.drawString(30, y, title); y -= 12
-        c.setFont("Helvetica", 10)
-        for ln in str(textv or "").splitlines():
-            c.drawString(30, y, ln[:110]); y -= 12
-            if y < 80: c.showPage(); y = H - 30
-        y -= 6
-
-    y -= 6
-    block("Título", irow.get("titulo"))
-    block("Descrição da não conformidade", irow.get("descricao"))
-    block("Referências", irow.get("referencias"))
-
-    if irow.get("encerrada_em") or irow.get("encerramento_desc") or irow.get("eficacia"):
-        block("Encerramento (observações / descrição / eficácia)",
-              f"{irow.get('encerramento_obs','')}\n{irow.get('encerramento_desc','')}\nEficácia: {irow.get('eficacia','')}")
-        line("Encerrado por / Em", f"{irow.get('encerrada_por','')} / {irow.get('encerrada_em','')}")
-
-    if irow.get("reaberta_em") or irow.get("reabertura_desc") or irow.get("reabertura_motivo"):
-        block("Reabertura (motivo / descrição)",
-              f"{irow.get('reabertura_motivo','')}\n{irow.get('reabertura_desc','')}")
-        line("Reaberta por / Em", f"{irow.get('reaberta_por','')} / {irow.get('reaberta_em','')}")
-
-    if irow.get("status") == "Cancelada":
-        block("Cancelamento", f"Motivo: {irow.get('cancelamento_motivo','')}")
-        line("Cancelada por / Em", f"{irow.get('cancelada_por','')} / {irow.get('cancelada_em','')}")
-
-    def draw_fotos(title, lst):
-        nonlocal y
-        if not lst: return
-        c.setFont("Helvetica-Bold", 11); c.drawString(30, y, title); y -= 10
-        x = 30; size = 140; pad = 8; col = 0
-        for fo in lst:
-            try:
-                if fo.get("url"):
-                    import requests
-                    r = requests.get(fo["url"], timeout=8)
-                    img = ImageReader(_io.BytesIO(r.content))
-                else:
-                    img = ImageReader(fo.get("path"))
-                if y - size < 60:
-                    c.showPage(); y = H - 30
-                c.drawImage(img, x, y-size, width=size, height=size, preserveAspectRatio=True, mask='auto')
-            except Exception:
-                pass
-            x += size + pad; col += 1
-            if col == 3:
-                col = 0; x = 30; y -= size + pad
-        y -= size + 10
-
-    draw_fotos("Fotos da abertura", fotos_ab)
-    draw_fotos("Evidências de encerramento", fotos_enc)
-    draw_fotos("Fotos da reabertura", fotos_rea)
-
-    c.showPage(); c.save()
-    buf.seek(0); return buf.read()
-
-# ----------------- UI / Sidebar -----------------
-def auth_box():
-    with st.sidebar.expander("🔐 Acesso Qualidade"):
-        pwd = st.text_input("Senha", type="password", key="pwd_q")
-        c1, c2 = st.columns(2)
-        if c1.button("Entrar"):
-            if pwd == QUALITY_PASS:
-                st.session_state.is_quality = True
-                st.success("Perfil Qualidade ativo.")
-            else:
-                st.error("Senha incorreta.")
-        if c2.button("Sair"):
-            st.session_state.is_quality = False
-            st.info("Saiu do perfil Qualidade.")
-
-    with st.sidebar.expander("🖼️ Logo da empresa (PDF)"):
-        up = st.file_uploader("Enviar logo (PNG/JPG)", type=["png","jpg","jpeg"], key="uplogo")
-        if up is not None:
-            set_logo(up.getbuffer().tobytes())
-            st.success("Logo atualizada.")
-        if st.button("Remover logo"):
-            clear_logo(); st.warning("Logo removida.")
-
+# ----------------- UI -----------------
 auth_box()
-
 menu = st.sidebar.radio("Menu", ["➕ Nova RNC", "🔎 Consultar/Editar", "🏷️ PEPs", "⬇️⬆️ CSV"])
 
 # ----------------- Nova RNC -----------------
 if menu == "➕ Nova RNC":
     st.title("Nova RNC (RNC Nº automático)")
-
-    # Preview seguro do número
+    # Preview seguro
     try:
         with engine.connect() as c:
             rnc_preview = next_rnc_num_sql(c)
@@ -458,7 +343,10 @@ if menu == "➕ Nova RNC":
         area = st.text_input("Área/Local", placeholder="Ex.: Correia TR-2011KS-07")
         categoria = st.selectbox("Categoria", ["Segurança","Qualidade","Meio Ambiente","Operação","Manutenção","Outros"])
         severidade = st.selectbox("Severidade", ["Baixa","Média","Alta","Crítica"])
-        pep = st.selectbox("PEP (código — descrição)", options=[""] + list_peps())
+        # PEPs
+        with engine.begin() as c:
+            peps = [r[0] for r in c.exec_driver_sql("SELECT code FROM peps ORDER BY code").fetchall()]
+        pep = st.selectbox("PEP (código — descrição)", options=[""] + peps)
 
         causador = st.selectbox("Causador", ["Solda","Pintura","Engenharia","Fornecedor","Cliente","Caldeiraria","Usinagem","Planejamento","Qualidade","RH","Outros"])
         processo = st.selectbox("Processo envolvido", ["Comercial","Compras","Planejamento","Recebimento","Produção","Inspeção Final","Segurança","Meio Ambiente","5S","RH","Outros"])
@@ -476,44 +364,23 @@ if menu == "➕ Nova RNC":
         if not is_quality():
             st.error("Somente Qualidade pode salvar. Faça login na barra lateral.")
         else:
+            payload = {
+                "data": datetime.combine(data_insp, datetime.min.time()),
+                "emit": emitente, "area": area, "pep": pep, "tit": titulo,
+                "desc": descricao, "refs": referencias, "cau": causador,
+                "proc": processo, "ori": origem, "sev": severidade, "cat": categoria
+            }
             with engine.begin() as conn:
-                real_num = next_rnc_num_sql(conn)
-                if DB_KIND == "postgresql":
-                    new_id = conn.exec_driver_sql("""
-                        INSERT INTO inspecoes
-                        (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
-                         processo_envolvido, origem, severidade, categoria, acoes, status)
-                        VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
-                        RETURNING id
-                    """, {
-                        "data": datetime.combine(data_insp, datetime.min.time()),
-                        "rnc": real_num, "emit": emitente, "area": area, "pep": pep, "tit": titulo,
-                        "desc": descricao, "refs": referencias, "cau": causador, "proc": processo, "ori": origem,
-                        "sev": severidade, "cat": categoria
-                    }).scalar_one()
-                else:
-                    conn.exec_driver_sql("""
-                        INSERT INTO inspecoes
-                        (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
-                         processo_envolvido, origem, severidade, categoria, acoes, status)
-                        VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
-                    """, {
-                        "data": datetime.combine(data_insp, datetime.min.time()),
-                        "rnc": real_num, "emit": emitente, "area": area, "pep": pep, "tit": titulo,
-                        "desc": descricao, "refs": referencias, "cau": causador, "proc": processo, "ori": origem,
-                        "sev": severidade, "cat": categoria
-                    })
-                    new_id = conn.exec_driver_sql("SELECT last_insert_rowid()").scalar()
-
-            metas = upload_photos(fotos_ab or [], real_num, "abertura")
+                new_id = insert_rnc_antifalha(conn, payload)
+                rnc = conn.exec_driver_sql("SELECT rnc_num FROM inspecoes WHERE id=:i", {"i": new_id}).scalar()
+            metas = upload_photos(fotos_ab or [], rnc, "abertura")
             with engine.begin() as conn:
                 for m in metas:
                     conn.exec_driver_sql("""
                         INSERT INTO fotos (inspecao_id, tipo, url, path, filename, mimetype)
                         VALUES (:i,:t,:u,:p,:n,:m)
                     """, {"i": new_id, "t": m["tipo"], "u": m["url"], "p": m["path"], "n": m["filename"], "m": m["mimetype"]})
-
-            st.success(f"RNC salva! Nº {real_num} (ID {new_id})")
+            st.success(f"RNC salva! Nº {rnc} (ID {new_id})")
 
 # ----------------- Consultar/Editar -----------------
 elif menu == "🔎 Consultar/Editar":
@@ -619,11 +486,10 @@ elif menu == "🏷️ PEPs":
     dfp = pd.read_sql("SELECT id, code FROM peps ORDER BY code", engine)
     st.dataframe(dfp, use_container_width=True, height=300)
 
-    st.subheader("Adicionar PEPs por CSV")
-    up_pep = st.file_uploader("CSV com 1 PEP por linha (coluna 'code' ou sem cabeçalho).", type=["csv"], key="up_pep")
+    st.subheader("Importar PEPs por CSV")
+    up_pep = st.file_uploader("CSV com coluna 'code' (ou 1 PEP por linha sem cabeçalho).", type=["csv"], key="up_pep")
     if up_pep and st.button("Importar PEPs do CSV"):
         try:
-            # tenta ler com cabeçalho
             dfp_in = pd.read_csv(up_pep)
             if 'code' in dfp_in.columns:
                 lst = [str(x) for x in dfp_in['code'].fillna('') if str(x).strip()]
@@ -651,12 +517,21 @@ elif menu == "🏷️ PEPs":
 
 # ----------------- CSV -----------------
 elif menu == "⬇️⬆️ CSV":
-    st.title("Importar / Exportar CSV")
+    st.title("Importar / Exportar CSV de RNCs")
     df_all = pd.read_sql("SELECT * FROM inspecoes ORDER BY id DESC", engine)
     st.download_button("⬇️ Exportar CSV", data=df_all.to_csv(index=False).encode("utf-8-sig"), file_name="rnc_export_v08.csv", mime="text/csv")
 
     st.subheader("Importar CSV de RNCs")
-    up = st.file_uploader("Selecione um CSV com colunas compatíveis com 'inspecoes' (não inclua 'id').", type=["csv"])
+    up = st.file_uploader("Selecione um CSV com colunas compatíveis (não inclua 'id').", type=["csv"])
+
+    def norm_dt(val):
+        if pd.isna(val) or str(val).strip() == "":
+            return None
+        try:
+            return pd.to_datetime(val, errors="coerce")
+        except Exception:
+            return None
+
     if up and st.button("Importar agora"):
         try:
             imp = pd.read_csv(up)
@@ -664,31 +539,72 @@ elif menu == "⬇️⬆️ CSV":
             up.seek(0)
             imp = pd.read_csv(up, sep=";")
 
-        # remove coluna id se vier
+        # remove id se vier
         if 'id' in imp.columns:
             imp = imp.drop(columns=['id'])
 
-        # lista de colunas válidas no banco
-        cols_db = [c for c in df_all.columns if c != 'id'] if not df_all.empty else list(imp.columns)
+        allowed = [
+            "data","rnc_num","emitente","area","pep","titulo","responsavel","descricao","referencias",
+            "causador","processo_envolvido","origem","severidade","categoria","acoes","status",
+            "encerrada_em","encerrada_por","encerramento_obs","encerramento_desc","eficacia",
+            "responsavel_acao","reaberta_em","reaberta_por","reabertura_motivo","reabertura_desc",
+            "cancelada_em","cancelada_por","cancelamento_motivo"
+        ]
+        cols = [c for c in imp.columns if c in allowed]
+        if not cols:
+            st.error("CSV sem colunas compatíveis com 'inspecoes'.")
+        else:
+            imp2 = imp[cols].copy()
+            for dc in ["data","encerrada_em","reaberta_em","cancelada_em"]:
+                if dc in imp2.columns:
+                    imp2[dc] = imp2[dc].apply(norm_dt)
 
-        # mantêm apenas colunas que existem de fato
-        use_cols = [c for c in imp.columns if c in cols_db]
-
-        # normaliza datas (coluna 'data', 'encerrada_em', 'reaberta_em', 'cancelada_em')
-        for dc in ['data','encerrada_em','reaberta_em','cancelada_em']:
-            if dc in use_cols:
-                try:
-                    imp[dc] = pd.to_datetime(imp[dc], errors='coerce')
-                except Exception:
-                    pass
-
-        with engine.begin() as conn:
-            for _, r in imp.fillna("").iterrows():
-                params = {k: r.get(k) for k in use_cols}
-                # completar chaves ausentes com NULL
-                for k in cols_db:
-                    if k not in params:
-                        params[k] = None
-                placeholders = ", ".join([f":{k}" for k in cols_db])
-                conn.exec_driver_sql(f"INSERT INTO inspecoes ({', '.join(cols_db)}) VALUES ({placeholders})", params)
-        st.success("Importação concluída.")
+            inserted, auto_num = 0, 0
+            with engine.begin() as conn:
+                for _, r in imp2.fillna("").iterrows():
+                    # monta payload básico (sem rnc_num, que podemos gerar)
+                    payload = {
+                        "data": r.get("data") if "data" in cols else None,
+                        "emit": r.get("emitente") if "emitente" in cols else None,
+                        "area": r.get("area") if "area" in cols else None,
+                        "pep": r.get("pep") if "pep" in cols else None,
+                        "tit": r.get("titulo") if "titulo" in cols else None,
+                        "desc": r.get("descricao") if "descricao" in cols else None,
+                        "refs": r.get("referencias") if "referencias" in cols else None,
+                        "cau": r.get("causador") if "causador" in cols else None,
+                        "proc": r.get("processo_envolvido") if "processo_envolvido" in cols else None,
+                        "ori": r.get("origem") if "origem" in cols else None,
+                        "sev": r.get("severidade") if "severidade" in cols else None,
+                        "cat": r.get("categoria") if "categoria" in cols else None,
+                    }
+                    # tenta honrar rnc_num do CSV; se faltar ou conflitar, gera automático
+                    csv_num = str(r.get("rnc_num")).strip() if "rnc_num" in cols else ""
+                    rid = None
+                    if csv_num:
+                        try:
+                            if DB_KIND == "postgresql":
+                                rid = conn.exec_driver_sql("""
+                                    INSERT INTO inspecoes
+                                    (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
+                                     processo_envolvido, origem, severidade, categoria, acoes, status)
+                                    VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
+                                    ON CONFLICT (rnc_num) DO NOTHING
+                                    RETURNING id
+                                """, dict(payload, rnc=csv_num)).scalar()
+                            else:
+                                conn.exec_driver_sql("""
+                                    INSERT OR IGNORE INTO inspecoes
+                                    (data, rnc_num, emitente, area, pep, titulo, responsavel, descricao, referencias, causador,
+                                     processo_envolvido, origem, severidade, categoria, acoes, status)
+                                    VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta')
+                                """, dict(payload, rnc=csv_num))
+                                rid = conn.exec_driver_sql("SELECT last_insert_rowid()").scalar()
+                                rid = int(rid) if rid else None
+                        except Exception:
+                            rid = None
+                    if not rid:
+                        # gera automático
+                        rid = insert_rnc_antifalha(conn, payload)
+                        auto_num += 1
+                    inserted += 1
+            st.success(f"Importação concluída. {inserted} linha(s). {auto_num} número(s) de RNC gerados automaticamente.")
