@@ -9,7 +9,7 @@ import pandas as pd
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-# Supabase (para fotos)
+# Supabase (para fotos via Storage)
 try:
     from supabase import create_client
 except Exception:
@@ -20,7 +20,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-BUILD_TAG = "v08-v6.2-supabase-counter-fix"
+BUILD_TAG = "v08-v6.3-counter-no-returning"
 
 st.set_page_config(page_title=f"RNC — {BUILD_TAG}", page_icon="📝", layout="wide")
 
@@ -30,7 +30,7 @@ SUPABASE_KEY    = os.getenv("SUPABASE_KEY", "")
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "RNC-FOTOS")
 QUALITY_PASS    = os.getenv("QUALITY_PASS", "qualidade123")
-INIT_DB_FLAG    = os.getenv("INIT_DB", "true").lower() == "true"  # permite pular migração
+INIT_DB_FLAG    = os.getenv("INIT_DB", "true").lower() == "true"
 
 # ----------------- Conexões -----------------
 def get_engine():
@@ -74,19 +74,17 @@ def try_sql(conn, sql: str):
 def init_db():
     with engine.begin() as conn:
         if DB_KIND == "postgresql":
-            # tenta usar public; se falhar, usa schema app
+            # forçar schema padrão
             err = try_sql(conn, "SET search_path TO public;")
             if err:
                 try_sql(conn, "CREATE SCHEMA IF NOT EXISTS app;")
                 try_sql(conn, "SET search_path TO app, public;")
-
-            diag = []
-            for sql in [
+            stmts = [
                 """
                 CREATE TABLE IF NOT EXISTS inspecoes (
                     id BIGSERIAL PRIMARY KEY,
                     data TIMESTAMP NULL,
-                    rnc_num TEXT,
+                    rnc_num TEXT UNIQUE,
                     emitente TEXT,
                     area TEXT,
                     pep TEXT,
@@ -147,20 +145,21 @@ def init_db():
                 );
                 """,
                 "CREATE UNIQUE INDEX IF NOT EXISTS uidx_inspecoes_rnc ON inspecoes (rnc_num);",
-            ]:
-                er = try_sql(conn, sql)
+            ]
+            diag = []
+            for s in stmts:
+                er = try_sql(conn, s)
                 if er: diag.append(er)
             if diag:
                 with st.expander("📋 Diagnóstico de migração (Postgres)"):
                     st.code("\n".join(diag))
         else:
-            # SQLite
             stmts = [
                 """
                 CREATE TABLE IF NOT EXISTS inspecoes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     data TIMESTAMP NULL,
-                    rnc_num TEXT,
+                    rnc_num TEXT UNIQUE,
                     emitente TEXT,
                     area TEXT,
                     pep TEXT,
@@ -225,7 +224,6 @@ def init_db():
             for s in stmts:
                 try_sql(conn, s)
 
-# roda migração só se permitido
 if INIT_DB_FLAG:
     init_db()
 
@@ -300,24 +298,26 @@ def upload_photos(files, rnc_num: str, tipo: str):
             st.error(f"Falha ao subir {f.name}: {e}")
     return out
 
-# ---------- Contador por ano (fix alias e seq inicial = 1) ----------
+# ---------- Contador por ano (sem RETURNING) ----------
 def next_rnc_num_tx(conn) -> str:
     y = int(datetime.now().year)
     if DB_KIND == "postgresql":
-        seq = conn.exec_driver_sql("""
+        # 1) UPSERT sem RETURNING
+        conn.exec_driver_sql("""
             INSERT INTO rnc_counters (year, last_seq)
             VALUES (:y, 1)
             ON CONFLICT (year)
-            DO UPDATE SET last_seq = rnc_counters.last_seq + 1
-            RETURNING last_seq;
-        """, {"y": y}).scalar_one()
+            DO UPDATE SET last_seq = rnc_counters.last_seq + 1;
+        """, {"y": y})
+        # 2) Lê o valor final
+        seq = conn.exec_driver_sql("SELECT last_seq FROM rnc_counters WHERE year=:y", {"y": y}).scalar_one()
     else:
         try:
-            seq = conn.exec_driver_sql("""
+            conn.exec_driver_sql("""
                 INSERT INTO rnc_counters(year, last_seq) VALUES (:y, 1)
-                ON CONFLICT(year) DO UPDATE SET last_seq = last_seq + 1
-                RETURNING last_seq;
-            """, {"y": y}).scalar_one()
+                ON CONFLICT(year) DO UPDATE SET last_seq = last_seq + 1;
+            """, {"y": y})
+            seq = conn.exec_driver_sql("SELECT last_seq FROM rnc_counters WHERE year=:y", {"y": y}).scalar_one()
         except Exception:
             row = conn.exec_driver_sql("SELECT last_seq FROM rnc_counters WHERE year=:y", {"y": y}).fetchone()
             if row is None:
@@ -329,8 +329,8 @@ def next_rnc_num_tx(conn) -> str:
     return f"{y}-{int(seq):03d}"
 
 def insert_rnc_with_counter(conn, payload: dict):
-    tentativas = 20
-    for _ in range(tentativas):
+    # Tenta até 20 vezes caso duas pessoas salvem ao mesmo tempo
+    for _ in range(20):
         num = next_rnc_num_tx(conn)
         payload2 = dict(payload); payload2["rnc"] = num
         try:
@@ -352,133 +352,50 @@ def insert_rnc_with_counter(conn, payload: dict):
                      processo_envolvido, origem, severidade, categoria, acoes, status)
                     VALUES (:data, :rnc, :emit, :area, :pep, :tit, '', :desc, :refs, :cau, :proc, :ori, :sev, :cat, '', 'Aberta');
                 """, payload2)
-                rid = conn.exec_driver_sql("SELECT last_insert_rowid()").scalar()
-                if rid and int(rid) > 0:
-                    return int(rid), num
+                lrid = conn.exec_driver_sql("SELECT last_insert_rowid()").scalar()
+                if lrid and int(lrid) > 0:
+                    return int(lrid), num
         except Exception:
             pass
         time.sleep(0.02)
     raise RuntimeError("Não foi possível alocar número de RNC.")
 
-# ----------------- PDF -----------------
-def generate_pdf(irow, fotos_ab, fotos_enc, fotos_rea):
-    import io as _io, requests
-    buf = _io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-    y = H - 30
+# ----------------- UI (igual às versões anteriores) -----------------
+def is_quality() -> bool:
+    return st.session_state.get("is_quality", False)
 
-    try:
-        logo = get_logo()
-        if logo:
-            c.drawImage(ImageReader(_io.BytesIO(logo)), 30, y-25, width=120, height=25, preserveAspectRatio=True, mask='auto')
-    except Exception:
-        pass
+def auth_box():
+    with st.sidebar.expander("🔐 Acesso Qualidade"):
+        pwd = st.text_input("Senha", type="password", key="pwd_q")
+        c1, c2 = st.columns(2)
+        if c1.button("Entrar"):
+            if pwd == QUALITY_PASS:
+                st.session_state.is_quality = True
+                st.success("Perfil Qualidade ativo.")
+            else:
+                st.error("Senha incorreta.")
+        if c2.button("Sair"):
+            st.session_state.is_quality = False
+            st.info("Saiu do perfil Qualidade.")
 
-    try:
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(170, y-10, "RNC - RELATÓRIO DE NÃO CONFORMIDADE")
-    except Exception:
-        pass
-    y -= 40
+    with st.sidebar.expander("🖼️ Logo da empresa (PDF)"):
+        up = st.file_uploader("Enviar logo (PNG/JPG)", type=["png","jpg","jpeg"], key="uplogo")
+        if up is not None:
+            set_logo(up.getbuffer().tobytes())
+            st.success("Logo atualizada.")
+        if st.button("Remover logo"):
+            clear_logo(); st.warning("Logo removida.")
 
-    def line(label, val):
-        nonlocal y
-        try:
-            c.setFont("Helvetica-Bold", 10); c.drawString(30, y, f"{label}: ")
-            c.setFont("Helvetica", 10); c.drawString(160, y, str(val or "")); y -= 14
-        except Exception:
-            y -= 14
-
-    def block(title, textv):
-        nonlocal y
-        try:
-            c.setFont("Helvetica-Bold", 11); c.drawString(30, y, title); y -= 12
-            c.setFont("Helvetica", 10)
-            for ln in str(textv or "").splitlines():
-                c.drawString(30, y, ln[:110]); y -= 12
-                if y < 80: c.showPage(); y = H - 30
-            y -= 6
-        except Exception:
-            y -= 6
-
-    line("RNC Nº", irow.get("rnc_num"))
-    line("Data", str(irow.get("data") or "")[:10])
-    line("Emitente", irow.get("emitente"))
-    line("Área/Local", irow.get("area"))
-    line("PEP", irow.get("pep"))
-    line("Categoria", irow.get("categoria"))
-    line("Severidade", irow.get("severidade"))
-    line("Causador / Processo / Origem",
-         f"{irow.get('causador','')} / {irow.get('processo_envolvido','')} / {irow.get('origem','')}")
-    line("Responsável", irow.get("responsavel"))
-
-    block("Título", irow.get("titulo"))
-    block("Descrição da não conformidade", irow.get("descricao"))
-    block("Referências", irow.get("referencias"))
-
-    if irow.get("encerrada_em") or irow.get("encerramento_desc") or irow.get("eficacia"):
-        block("Encerramento (observações / descrição / eficácia)",
-              f"{irow.get('encerramento_obs','')}\n{irow.get('encerramento_desc','')}\nEficácia: {irow.get('eficacia','')}")
-    if irow.get("reaberta_em") or irow.get("reabertura_desc") or irow.get("reabertura_motivo"):
-        block("Reabertura (motivo / descrição)",
-              f"{irow.get('reabertura_motivo','')}\n{irow.get('reabertura_desc','')}")
-    if irow.get("status") == "Cancelada":
-        block("Cancelamento", f"Motivo: {irow.get('cancelamento_motivo','')}")
-
-    def draw_fotos(title, lst):
-        nonlocal y
-        if not lst: return
-        try:
-            c.setFont("Helvetica-Bold", 11); c.drawString(30, y, title); y -= 10
-            x = 30; size = 140; pad = 8; col = 0
-            for fo in lst:
-                try:
-                    if fo.get("url"):
-                        import requests
-                        r = requests.get(fo["url"], timeout=8)
-                        img = ImageReader(_io.BytesIO(r.content))
-                    else:
-                        img = ImageReader(fo.get("path"))
-                    if y - size < 60:
-                        c.showPage(); y = H - 30
-                    c.drawImage(img, x, y-size, width=size, height=size, preserveAspectRatio=True, mask='auto')
-                except Exception:
-                    pass
-                x += size + pad; col += 1
-                if col == 3:
-                    col = 0; x = 30; y -= size + pad
-            y -= size + 10
-        except Exception:
-            pass
-
-    draw_fotos("Fotos da abertura", fotos_ab)
-    draw_fotos("Evidências de encerramento", fotos_enc)
-    draw_fotos("Fotos da reabertura", fotos_rea)
-
-    c.showPage(); c.save()
-    buf.seek(0); return buf.read()
-
-# ----------------- UI -----------------
-def list_peps():
-    with engine.begin() as c:
-        return [r[0] for r in c.exec_driver_sql("SELECT code FROM peps ORDER BY code").fetchall()]
-
-def add_peps_bulk(codes):
-    ok = 0
+def set_logo(image_bytes: bytes):
     with engine.begin() as conn:
-        for c in codes:
-            c = c.strip()
-            if not c: continue
-            try:
-                if DB_KIND == "postgresql":
-                    conn.exec_driver_sql("INSERT INTO peps(code) VALUES(:c) ON CONFLICT (code) DO NOTHING", {"c": c})
-                else:
-                    conn.exec_driver_sql("INSERT OR IGNORE INTO peps(code) VALUES(:c)", {"c": c})
-                ok += 1
-            except Exception:
-                pass
-    return ok
+        if DB_KIND == "postgresql":
+            conn.exec_driver_sql("INSERT INTO settings(key, blob) VALUES('logo', :b) ON CONFLICT (key) DO UPDATE SET blob=EXCLUDED.blob", {"b": image_bytes})
+        else:
+            conn.exec_driver_sql("INSERT OR REPLACE INTO settings(key, blob) VALUES('logo', :b)", {"b": image_bytes})
+
+def clear_logo():
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM settings WHERE key='logo'")
 
 auth_box()
 menu = st.sidebar.radio("Menu", ["➕ Nova RNC", "🔎 Consultar/Editar", "🏷️ PEPs", "⬇️⬆️ CSV", "ℹ️ Status"])
@@ -495,7 +412,9 @@ if menu == "➕ Nova RNC":
         area = st.text_input("Área/Local", placeholder="Ex.: Correia TR-2011KS-07")
         categoria = st.selectbox("Categoria", ["Segurança","Qualidade","Meio Ambiente","Operação","Manutenção","Outros"])
         severidade = st.selectbox("Severidade", ["Baixa","Média","Alta","Crítica"])
-        pep = st.selectbox("PEP (código — descrição)", options=[""] + list_peps())
+        with engine.begin() as conn:
+            peps = [r[0] for r in conn.exec_driver_sql("SELECT code FROM peps ORDER BY code").fetchall()]
+        pep = st.selectbox("PEP (código — descrição)", options=[""] + peps)
 
         causador = st.selectbox("Causador", ["Solda","Pintura","Engenharia","Fornecedor","Cliente","Caldeiraria","Usinagem","Planejamento","Qualidade","RH","Outros"])
         processo = st.selectbox("Processo envolvido", ["Comercial","Compras","Planejamento","Recebimento","Produção","Inspeção Final","Segurança","Meio Ambiente","5S","RH","Outros"])
