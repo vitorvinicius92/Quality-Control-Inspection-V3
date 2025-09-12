@@ -1,5 +1,5 @@
 
-import os, io, uuid, traceback
+import os, io, uuid, traceback, csv
 from datetime import datetime, date
 from typing import List, Optional
 
@@ -24,7 +24,7 @@ from reportlab.lib.utils import ImageReader
 import smtplib
 from email.message import EmailMessage
 
-st.set_page_config(page_title="RNC v08 — Completo (PG fix v2)", page_icon="📝", layout="wide")
+st.set_page_config(page_title="RNC v08 — Completo (PG fix v3)", page_icon="📝", layout="wide")
 
 # ----------------- Secrets / Env -----------------
 SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
@@ -134,6 +134,8 @@ def init_db():
                 text TEXT
             );
             """)
+            # índice único opcional em rnc_num
+            conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uidx_inspecoes_rnc ON inspecoes (rnc_num);")
         else:
             conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS inspecoes (
@@ -193,6 +195,7 @@ def init_db():
                 text TEXT
             );
             """)
+            conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uidx_inspecoes_rnc ON inspecoes (rnc_num);")
 
 init_db()
 
@@ -214,19 +217,25 @@ def require_quality():
             st.session_state.is_quality = False
             st.info("Saiu do perfil Qualidade.")
 
-def next_rnc_num(conn) -> str:
+def next_rnc_num_sql(conn) -> str:
     y = datetime.now().year
-    rows = conn.exec_driver_sql("SELECT rnc_num FROM inspecoes WHERE rnc_num LIKE :p", {"p": f"{y}-%"}).fetchall()
-    seqs = []
-    for (rnc,) in rows:
-        if not rnc: continue
-        try:
-            if str(rnc).startswith(f"{y}-"):
-                seqs.append(int(str(rnc).split("-")[1]))
-        except Exception:
-            pass
-    nxt = (max(seqs) + 1) if seqs else 1
-    return f"{y}-{nxt:03d}"
+    if DB_KIND == "postgresql":
+        # usa split_part para pegar o sufixo numérico
+        q = text("""
+            SELECT COALESCE(MAX(CAST(SPLIT_PART(rnc_num, '-', 2) AS INTEGER)), 0)
+            FROM inspecoes
+            WHERE rnc_num LIKE :p
+        """)
+        mx = conn.execute(q, {"p": f"{y}-%"}).scalar() or 0
+    else:
+        # sqlite: substr após '-'
+        q = text("""
+            SELECT COALESCE(MAX(CAST(substr(rnc_num, instr(rnc_num, '-')+1) AS INTEGER)), 0)
+            FROM inspecoes
+            WHERE rnc_num LIKE :p
+        """)
+        mx = conn.execute(q, {"p": f"{y}-%"}).scalar() or 0
+    return f"{y}-{int(mx)+1:03d}"
 
 def list_peps() -> List[str]:
     with engine.begin() as conn:
@@ -380,6 +389,7 @@ def generate_pdf(irow: dict, fotos_ab: List[dict], fotos_enc: List[dict], fotos_
         for fo in lst:
             try:
                 if fo.get("url"):
+                    import requests
                     r = requests.get(fo["url"], timeout=8)
                     img = ImageReader(_io.BytesIO(r.content))
                 else:
@@ -432,15 +442,14 @@ menu = st.sidebar.radio("Menu", ["➕ Nova RNC", "🔎 Consultar/Editar", "🏷�
 if menu == "➕ Nova RNC":
     st.title("Nova RNC (RNC Nº automático)")
 
-    # Gera o número ANTES de abrir o form (evita erro e alerta de submit)
+    # Preview seguro do número
     try:
         with engine.connect() as c:
-            rnc_preview = next_rnc_num(c)
-    except Exception as e:
+            rnc_preview = next_rnc_num_sql(c)
+    except Exception:
         rnc_preview = f"{datetime.now().year}-001"
-        st.warning("Não consegui prever o número da RNC agora. Vou exibir 001 como exemplo.")
 
-    with st.form("form_rnc", clear_on_submit=False):
+    with st.form("form_rnc"):
         col0, col1, col2 = st.columns(3)
         emitente = col0.text_input("Emitente")
         data_insp = col1.date_input("Data", value=date.today())
@@ -468,8 +477,7 @@ if menu == "➕ Nova RNC":
             st.error("Somente Qualidade pode salvar. Faça login na barra lateral.")
         else:
             with engine.begin() as conn:
-                # gera o número real no momento do insert
-                real_num = next_rnc_num(conn)
+                real_num = next_rnc_num_sql(conn)
                 if DB_KIND == "postgresql":
                     new_id = conn.exec_driver_sql("""
                         INSERT INTO inspecoes
@@ -610,7 +618,28 @@ elif menu == "🏷️ PEPs":
     st.title("Gerenciar PEPs")
     dfp = pd.read_sql("SELECT id, code FROM peps ORDER BY code", engine)
     st.dataframe(dfp, use_container_width=True, height=300)
-    many = st.text_area("Adicionar vários (um por linha, formato livre: código — descrição).", height=140)
+
+    st.subheader("Adicionar PEPs por CSV")
+    up_pep = st.file_uploader("CSV com 1 PEP por linha (coluna 'code' ou sem cabeçalho).", type=["csv"], key="up_pep")
+    if up_pep and st.button("Importar PEPs do CSV"):
+        try:
+            # tenta ler com cabeçalho
+            dfp_in = pd.read_csv(up_pep)
+            if 'code' in dfp_in.columns:
+                lst = [str(x) for x in dfp_in['code'].fillna('') if str(x).strip()]
+            else:
+                up_pep.seek(0)
+                reader = csv.reader(io.StringIO(up_pep.getvalue().decode('utf-8')))
+                lst = [row[0] for row in reader if row and str(row[0]).strip()]
+        except Exception:
+            up_pep.seek(0)
+            reader = csv.reader(io.StringIO(up_pep.getvalue().decode('utf-8')))
+            lst = [row[0] for row in reader if row and str(row[0]).strip()]
+        n = add_peps_bulk(lst)
+        st.success(f"{n} PEP(s) adicionados.")
+
+    st.subheader("Adicionar PEPs manualmente")
+    many = st.text_area("Vários (um por linha, formato livre: código — descrição).", height=140)
     if st.button("Adicionar em lote"):
         codes = [l.strip() for l in many.splitlines() if l.strip()]
         n = add_peps_bulk(codes)
@@ -626,18 +655,37 @@ elif menu == "⬇️⬆️ CSV":
     df_all = pd.read_sql("SELECT * FROM inspecoes ORDER BY id DESC", engine)
     st.download_button("⬇️ Exportar CSV", data=df_all.to_csv(index=False).encode("utf-8-sig"), file_name="rnc_export_v08.csv", mime="text/csv")
 
-    st.subheader("Importar CSV")
-    up = st.file_uploader("Selecione um CSV com as mesmas colunas de 'inspecoes'", type=["csv"])
+    st.subheader("Importar CSV de RNCs")
+    up = st.file_uploader("Selecione um CSV com colunas compatíveis com 'inspecoes' (não inclua 'id').", type=["csv"])
     if up and st.button("Importar agora"):
         try:
             imp = pd.read_csv(up)
         except Exception:
             up.seek(0)
             imp = pd.read_csv(up, sep=";")
-        cols_db = df_all.columns.tolist() if not df_all.empty else imp.columns.tolist()
+
+        # remove coluna id se vier
+        if 'id' in imp.columns:
+            imp = imp.drop(columns=['id'])
+
+        # lista de colunas válidas no banco
+        cols_db = [c for c in df_all.columns if c != 'id'] if not df_all.empty else list(imp.columns)
+
+        # mantêm apenas colunas que existem de fato
+        use_cols = [c for c in imp.columns if c in cols_db]
+
+        # normaliza datas (coluna 'data', 'encerrada_em', 'reaberta_em', 'cancelada_em')
+        for dc in ['data','encerrada_em','reaberta_em','cancelada_em']:
+            if dc in use_cols:
+                try:
+                    imp[dc] = pd.to_datetime(imp[dc], errors='coerce')
+                except Exception:
+                    pass
+
         with engine.begin() as conn:
             for _, r in imp.fillna("").iterrows():
-                params = {k: r.get(k) for k in cols_db if k in imp.columns}
+                params = {k: r.get(k) for k in use_cols}
+                # completar chaves ausentes com NULL
                 for k in cols_db:
                     if k not in params:
                         params[k] = None
